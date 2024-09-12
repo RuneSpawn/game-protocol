@@ -22,9 +22,9 @@ include(
     "protocol",
     "crypto",
     "compression",
+    "protocol",
+    "protocol:osrs-224"
 )
-
-includeSubprojects(":protocol")
 
 fun includeSubprojects(projectName: String) {
     val projectPath = project(projectName).projectDir.toPath()
