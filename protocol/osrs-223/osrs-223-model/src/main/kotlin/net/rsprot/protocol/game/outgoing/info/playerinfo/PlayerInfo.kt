@@ -83,6 +83,7 @@ public class PlayerInfo internal constructor(
      * This exception will be propagated further during the [toPacket] function call,
      * allowing the server to handle it properly at a per-player basis.
      */
+    @Volatile
     internal var exception: Exception? = null
 
     /**
@@ -106,6 +107,8 @@ public class PlayerInfo internal constructor(
      * world basis.
      */
     private var invalidateAppearanceCache: Boolean = false
+
+    override fun isDestroyed(): Boolean = this.exception != null
 
     /**
      * Checks if appearance needs invalidation, and invalidates if so.
@@ -170,6 +173,32 @@ public class PlayerInfo internal constructor(
         }
         val details = getDetails(worldId)
         details.buildArea = buildArea
+    }
+
+    /**
+     * Updates the build area of a given world to the specified one.
+     * This will ensure that no players outside of this box will be
+     * added to high resolution view.
+     * @param worldId the id of the world to set the build area of,
+     * with -1 being the root world.
+     * @param zoneX the south-western zone x coordinate of the build area
+     * @param zoneZ the south-western zone z coordinate of the build area
+     * @param widthInZones the build area width in zones (typically 13, meaning 104 tiles)
+     * @param heightInZones the build area height in zones (typically 13, meaning 104 tiles)
+     */
+    @JvmOverloads
+    public fun updateBuildArea(
+        worldId: Int,
+        zoneX: Int,
+        zoneZ: Int,
+        widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+        heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+    ) {
+        require(worldId == ROOT_WORLD || worldId in 0..<2048) {
+            "World id must be -1 or in range of 0..<2048"
+        }
+        val details = getDetails(worldId)
+        details.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
     /**
@@ -682,6 +711,12 @@ public class PlayerInfo internal constructor(
         if (other.avatar.hidden) {
             return false
         }
+        // If the avatar was allocated on this cycle, ensure we remove (and potentially re-add later)
+        // this avatar. This is due to someone logging out and another player taking the avatar the same
+        // cycle - which would otherwise potentially go by unnoticed, with the client assuming nothing changed.
+        if (other.avatar.allocateCycle == PlayerInfoProtocol.cycleCount) {
+            return false
+        }
         val coord = other.avatar.currentCoord
         if (!details.renderCoord.inDistance(coord, this.avatar.resizeRange)) {
             return false
@@ -798,6 +833,7 @@ public class PlayerInfo internal constructor(
         avatar.extendedInfo.localIndex = index
         this.oldSchoolClientType = oldSchoolClientType
         avatar.reset()
+        this.avatar.allocateCycle = PlayerInfoProtocol.cycleCount
         this.activeWorldId = ROOT_WORLD
         // There is always a root world!
         val rootDetails = protocol.detailsStorage.poll(ROOT_WORLD)

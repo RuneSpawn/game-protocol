@@ -135,6 +135,7 @@ public class NpcInfo internal constructor(
      * This exception will be propagated further during the [toNpcInfoPacket] function call,
      * allowing the server to handle it properly at a per-player basis.
      */
+    @Volatile
     internal var exception: Exception? = null
 
     /**
@@ -145,6 +146,8 @@ public class NpcInfo internal constructor(
      * any memory leaks.
      */
     private var builtIntoPacket: Boolean = false
+
+    override fun isDestroyed(): Boolean = this.exception != null
 
     /**
      * Returns the backing byte buffer holding all the computed information.
@@ -167,6 +170,35 @@ public class NpcInfo internal constructor(
      */
     public fun resetViewDistance() {
         this.viewDistance = MAX_SMALL_PACKET_DISTANCE
+    }
+
+    /**
+     * Gets the high resolution indices in a new arraylist of integers.
+     * The list is initialized to an initial capacity equal to the high resolution npc index count.
+     * @return the newly created arraylist of indices
+     */
+    public fun getHighResolutionIndices(): ArrayList<Int> {
+        val collection = ArrayList<Int>(highResolutionNpcIndexCount)
+        for (i in 0..<highResolutionNpcIndexCount) {
+            val index = highResolutionNpcIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
+     * Appends the high resolution indices to the provided [collection]. This can be used to determine which NPCs the
+     * player is currently seeing in the client. Servers often rely on this metric to determine things
+     * such as aggression/hunt.
+     * @param collection the mutable collection of integer indices to append the indices into.
+     * @return the provided [collection] to chaining.
+     */
+    public fun <T> appendHighResolutionIndices(collection: T): T where T : MutableCollection<Int> {
+        for (i in 0..<highResolutionNpcIndexCount) {
+            val index = highResolutionNpcIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
     }
 
     /**
@@ -197,6 +229,25 @@ public class NpcInfo internal constructor(
      */
     public fun updateBuildArea(buildArea: BuildArea) {
         this.buildArea = buildArea
+    }
+
+    /**
+     * Updates the build area for this NPC info.
+     * This will ensure that no NPCs outside of this box will be
+     * added to high resolution view.
+     * @param zoneX the south-western zone x coordinate of the build area
+     * @param zoneZ the south-western zone z coordinate of the build area
+     * @param widthInZones the build area width in zones (typically 13, meaning 104 tiles)
+     * @param heightInZones the build area height in zones (typically 13, meaning 104 tiles)
+     */
+    @JvmOverloads
+    public fun updateBuildArea(
+        zoneX: Int,
+        zoneZ: Int,
+        widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+        heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+    ) {
+        this.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
     /**

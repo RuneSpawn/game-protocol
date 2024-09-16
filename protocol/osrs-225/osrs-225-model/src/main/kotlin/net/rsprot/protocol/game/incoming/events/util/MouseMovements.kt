@@ -1,13 +1,12 @@
 package net.rsprot.protocol.game.incoming.events.util
 
 /**
- * A value class that wraps around an array of mouse movements,
+ * A class that wraps around an array of mouse movements,
  * with the encoding specified by [MousePosChange].
  * @property length the number of mouse movements in this packet.
  */
 @Suppress("MemberVisibilityCanBePrivate")
-@JvmInline
-public value class MouseMovements(
+public class MouseMovements(
     private val movements: LongArray,
 ) {
     public val length: Int
@@ -34,7 +33,7 @@ public value class MouseMovements(
     public fun getMousePosChange(index: Int): MousePosChange = MousePosChange(movements[index])
 
     /**
-     * A value class for mouse position changes, packed into a primitive long.
+     * A class for mouse position changes, packed into a primitive long.
      * We utilize bitpacking in order to use primitive long arrays for space
      * constraints.
      * @property packed the bitpacked long value, exposed as servers may wish
@@ -45,10 +44,15 @@ public value class MouseMovements(
      * mouse goes outside the client window, the value will be -1.
      * @property yDelta the y coordinate delta of the mouse, in pixels. If the
      * mouse goes outside the client window, the value will be -1.
+     * @property lastMouseButton the last mouse button that was clicked shortly
+     * before the mouse movement. Value 0 means no recent click, 2 means left
+     * mouse click, 8 means right mouse click and 14 means middle mouse click.
+     * Other buttons are unknown but may also be possible.
+     * The value is 0xFFFF if no mouse button property is included, which is
+     * the case for the java variant of this packet.
      */
     @Suppress("MemberVisibilityCanBePrivate")
-    @JvmInline
-    public value class MousePosChange(
+    public class MousePosChange(
         public val packed: Long,
     ) {
         public constructor(
@@ -56,10 +60,19 @@ public value class MouseMovements(
             xDelta: Int,
             yDelta: Int,
         ) : this(
-            (timeDelta and 0xFFFF)
-                .toLong()
-                .or(xDelta.toLong() and 0xFFFF shl 16)
-                .or(yDelta.toLong() and 0xFFFF shl 32),
+            timeDelta,
+            xDelta,
+            yDelta,
+            -1,
+        )
+
+        public constructor(
+            timeDelta: Int,
+            xDelta: Int,
+            yDelta: Int,
+            lastMouseButton: Int,
+        ) : this(
+            pack(timeDelta, xDelta, yDelta, lastMouseButton),
         )
 
         public val timeDelta: Int
@@ -68,12 +81,41 @@ public value class MouseMovements(
             get() = (packed ushr 16 and 0xFFFF).toShort().toInt()
         public val yDelta: Int
             get() = (packed ushr 32 and 0xFFFF).toShort().toInt()
+        public val lastMouseButton: Int
+            get() = (packed ushr 48 and 0xFFFF).toInt()
 
         override fun toString(): String =
             "MousePosChange(" +
                 "timeDelta=$timeDelta, " +
                 "xDelta=$xDelta, " +
                 "yDelta=$yDelta" +
+                (if (lastMouseButton != 0xFFFF) "lastMouseButton=$lastMouseButton" else "") +
                 ")"
+
+        public companion object {
+            public fun pack(
+                timeDelta: Int,
+                xDelta: Int,
+                yDelta: Int,
+            ): Long =
+                pack(
+                    timeDelta,
+                    xDelta,
+                    yDelta,
+                    -1,
+                )
+
+            public fun pack(
+                timeDelta: Int,
+                xDelta: Int,
+                yDelta: Int,
+                lastMouseButton: Int,
+            ): Long =
+                (timeDelta and 0xFFFF)
+                    .toLong()
+                    .or(xDelta.toLong() and 0xFFFF shl 16)
+                    .or(yDelta.toLong() and 0xFFFF shl 32)
+                    .or(lastMouseButton.toLong() and 0xFFFF shl 48)
+        }
     }
 }

@@ -82,9 +82,13 @@ public class WorldEntityInfo internal constructor(
     private val addedWorldEntities = ArrayList<Int>()
     private val removedWorldEntities = ArrayList<Int>()
     private var buffer: ByteBuf? = null
+
+    @Volatile
     internal var exception: Exception? = null
     private var builtIntoPacket: Boolean = false
     private var renderCoord: CoordGrid = CoordGrid.INVALID
+
+    override fun isDestroyed(): Boolean = this.exception != null
 
     /**
      * Updates the render distance for this player, potentially allowing
@@ -106,6 +110,24 @@ public class WorldEntityInfo internal constructor(
      */
     public fun updateBuildArea(buildArea: BuildArea) {
         this.buildArea = buildArea
+    }
+
+    /**
+     * Updates the build area for this player. This should always perfectly correspond to
+     * the actual build area that is sent via REBUILD_NORMAL or REBUILD_REGION packets.
+     * @property zoneX the south-western zone x coordinate of the build area
+     * @property zoneZ the south-western zone z coordinate of the build area
+     * @property widthInZones the build area width in zones (typically 13, meaning 104 tiles)
+     * @property heightInZones the build area height in zones (typically 13, meaning 104 tiles)
+     */
+    @JvmOverloads
+    public fun updateBuildArea(
+        zoneX: Int,
+        zoneZ: Int,
+        widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+        heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+    ) {
+        this.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
     /**
@@ -273,7 +295,7 @@ public class WorldEntityInfo internal constructor(
         for (i in 0..<count) {
             val index = this.highResolutionIndices[i].toInt()
             val avatar = avatarRepository.getOrNull(index)
-            if (avatar == null || !inRange(avatar)) {
+            if (avatar == null || !inRange(avatar) || isReallocated(avatar)) {
                 highResolutionIndices[i] = INDEX_TERMINATOR
                 this.highResolutionIndicesCount--
                 this.removedWorldEntities += index
@@ -389,6 +411,13 @@ public class WorldEntityInfo internal constructor(
                         renderDistance,
                     )
             )
+    }
+
+    private fun isReallocated(avatar: WorldEntityAvatar): Boolean {
+        // If the avatar was allocated on this cycle, ensure we remove (and potentially re-add later)
+        // this avatar. This is due to a worldentity of the same index being deallocated and reallocated
+        // as a new instance in the same cycle.
+        return avatar.allocateCycle == WorldEntityProtocol.cycleCount
     }
 
     override fun onAlloc(

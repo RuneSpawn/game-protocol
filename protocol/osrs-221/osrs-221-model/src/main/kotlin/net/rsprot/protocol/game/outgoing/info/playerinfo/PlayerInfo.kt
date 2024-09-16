@@ -150,6 +150,7 @@ public class PlayerInfo internal constructor(
      * This exception will be propagated further during the [toPacket] function call,
      * allowing the server to handle it properly at a per-player basis.
      */
+    @Volatile
     internal var exception: Exception? = null
 
     /**
@@ -174,6 +175,8 @@ public class PlayerInfo internal constructor(
     @Throws(IllegalStateException::class)
     public fun backingBuffer(): ByteBuf = checkNotNull(buffer)
 
+    override fun isDestroyed(): Boolean = this.exception != null
+
     /**
      * Updates the build area of this player info object.
      * This will ensure that no players outside of this box will be
@@ -182,6 +185,25 @@ public class PlayerInfo internal constructor(
      */
     public fun updateBuildArea(buildArea: BuildArea) {
         this.buildArea = buildArea
+    }
+
+    /**
+     * Updates the build area of this player info object.
+     * This will ensure that no players outside of this box will be
+     * added to high resolution view.
+     * @param zoneX the south-western zone x coordinate of the build area
+     * @param zoneZ the south-western zone z coordinate of the build area
+     * @param widthInZones the build area width in zones (typically 13, meaning 104 tiles)
+     * @param heightInZones the build area height in zones (typically 13, meaning 104 tiles)
+     */
+    @JvmOverloads
+    public fun updateBuildArea(
+        zoneX: Int,
+        zoneZ: Int,
+        widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+        heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+    ) {
+        this.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
     /**
@@ -610,6 +632,12 @@ public class PlayerInfo internal constructor(
         if (other.avatar.hidden) {
             return false
         }
+        // If the avatar was allocated on this cycle, ensure we remove (and potentially re-add later)
+        // this avatar. This is due to someone logging out and another player taking the avatar the same
+        // cycle - which would otherwise potentially go by unnoticed, with the client assuming nothing changed.
+        if (other.avatar.allocateCycle == PlayerInfoProtocol.cycleCount) {
+            return false
+        }
         val coord = other.avatar.currentCoord
         if (!coord.inDistance(this.avatar.currentCoord, this.avatar.resizeRange)) {
             return false
@@ -708,6 +736,7 @@ public class PlayerInfo internal constructor(
         this.oldSchoolClientType = oldSchoolClientType
         this.buildArea = BuildArea.INVALID
         avatar.reset()
+        this.avatar.allocateCycle = PlayerInfoProtocol.cycleCount
         lowResolutionIndices.fill(0)
         lowResolutionCount = 0
         highResolutionIndices.fill(0)

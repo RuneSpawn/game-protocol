@@ -58,6 +58,7 @@ public class NpcInfo internal constructor(
      * This exception will be propagated further during the [toNpcInfoPacket] function call,
      * allowing the server to handle it properly at a per-player basis.
      */
+    @Volatile
     internal var exception: Exception? = null
 
     /**
@@ -65,6 +66,8 @@ public class NpcInfo internal constructor(
      * The root world is placed at the end of this array, however id -1 will be treated as the root.
      */
     internal val details: Array<NpcInfoWorldDetails?> = arrayOfNulls(WORLD_ENTITY_CAPACITY + 1)
+
+    override fun isDestroyed(): Boolean = this.exception != null
 
     /**
      * Updates the build area of a given world to the specified one.
@@ -83,6 +86,32 @@ public class NpcInfo internal constructor(
         }
         val details = getDetails(worldId)
         details.buildArea = buildArea
+    }
+
+    /**
+     * Updates the build area of a given world to the specified one.
+     * This will ensure that no NPCs outside of this box will be
+     * added to high resolution view.
+     * @param worldId the id of the world to set the build area of,
+     * with -1 being the root world.
+     * @param zoneX the south-western zone x coordinate of the build area
+     * @param zoneZ the south-western zone z coordinate of the build area
+     * @param widthInZones the build area width in zones (typically 13, meaning 104 tiles)
+     * @param heightInZones the build area height in zones (typically 13, meaning 104 tiles)
+     */
+    @JvmOverloads
+    public fun updateBuildArea(
+        worldId: Int,
+        zoneX: Int,
+        zoneZ: Int,
+        widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+        heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
+    ) {
+        require(worldId == ROOT_WORLD || worldId in 0..<2048) {
+            "World id must be -1 or in range of 0..<2048"
+        }
+        val details = getDetails(worldId)
+        details.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
     /**
@@ -133,6 +162,100 @@ public class NpcInfo internal constructor(
         return checkNotNull(details) {
             "World info details not allocated for world $worldId"
         }
+    }
+
+    /**
+     * Gets the world details implementation of the specified [worldId], or null if it doesn't exist.
+     * This function will throw an exception if it is called post-deallocation for the root world,
+     * as it will then be deallocated.
+     */
+    private fun getDetailsOrNull(worldId: Int): NpcInfoWorldDetails? {
+        val details =
+            if (worldId == ROOT_WORLD) {
+                details[WORLD_ENTITY_CAPACITY]
+            } else {
+                if (worldId !in 0..<WORLD_ENTITY_CAPACITY) {
+                    return null
+                }
+                details[worldId]
+            }
+        return details
+    }
+
+    /**
+     * Gets the high resolution indices of the given [worldId] in a new arraylist of integers.
+     * The list is initialized to an initial capacity equal to the high resolution npc index count.
+     * @param worldId the worldId to collect the indices from. For root world, use [ROOT_WORLD].
+     * @throws IllegalArgumentException if the world id is not in range of 0..<2048, or [ROOT_WORLD].
+     * @throws IllegalStateException if the provided world has not been allocated. It is up to the
+     * caller to ensure the world they're accessible is available. Root world will always be available
+     * as long as the given info object is allocated.
+     * @return the newly created arraylist of indices
+     */
+    public fun getHighResolutionIndices(worldId: Int): ArrayList<Int> {
+        val details = getDetails(worldId)
+        val collection = ArrayList<Int>(details.highResolutionNpcIndexCount)
+        for (i in 0..<details.highResolutionNpcIndexCount) {
+            val index = details.highResolutionNpcIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
+     * Gets the high resolution indices of the given [worldId] in a new arraylist of integers, or null
+     * if the provided world does not exist.
+     * The list is initialized to an initial capacity equal to the high resolution npc index count.
+     * @param worldId the worldId to collect the indices from. For root world, use [ROOT_WORLD].
+     * @throws IllegalArgumentException if the world id is not in range of 0..<2048, or [ROOT_WORLD].
+     * @throws IllegalStateException if the provided world has not been allocated. It is up to the
+     * caller to ensure the world they're accessible is available. Root world will always be available
+     * as long as the given info object is allocated.
+     * @return the newly created arraylist of indices, or null if the world does not exist.
+     */
+    public fun getHighResolutionIndicesOrNull(worldId: Int): ArrayList<Int>? {
+        val details = getDetailsOrNull(worldId) ?: return null
+        val collection = ArrayList<Int>(details.highResolutionNpcIndexCount)
+        for (i in 0..<details.highResolutionNpcIndexCount) {
+            val index = details.highResolutionNpcIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
+     * Appends the high resolution indices of the given [worldId] to the provided
+     * [collection]. This can be used to determine which NPCs the player is currently
+     * seeing in the client. Servers often rely on this metric to determine things
+     * such as aggression/hunt.
+     * @param worldId the worldId to collect the indices from. For root world, use [ROOT_WORLD].
+     * @param collection the mutable collection of integer indices to append the indices into.
+     * @param throwExceptionIfNoWorld whether to throw an exception if the world does not exist.
+     * @throws IllegalArgumentException if the world id is not in range of 0..<2048, or [ROOT_WORLD],
+     * as long as [throwExceptionIfNoWorld] is true.
+     * @throws IllegalStateException if the provided world has not been allocated. It is up to the
+     * caller to ensure the world they're accessible is available. Root world will always be available
+     * as long as the given info object is allocated. This will only be thrown if [throwExceptionIfNoWorld]
+     * is true.
+     * @return the provided [collection] to chaining.
+     */
+    @JvmOverloads
+    public fun <T> appendHighResolutionIndices(
+        worldId: Int,
+        collection: T,
+        throwExceptionIfNoWorld: Boolean = true,
+    ): T where T : MutableCollection<Int> {
+        val details =
+            if (throwExceptionIfNoWorld) {
+                getDetails(worldId)
+            } else {
+                getDetailsOrNull(worldId) ?: return collection
+            }
+        for (i in 0..<details.highResolutionNpcIndexCount) {
+            val index = details.highResolutionNpcIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
     }
 
     /**
