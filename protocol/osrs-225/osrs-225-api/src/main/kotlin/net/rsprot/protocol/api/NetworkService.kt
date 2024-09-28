@@ -6,7 +6,7 @@ import io.netty.channel.ChannelFuture
 import io.netty.channel.EventLoopGroup
 import net.rsprot.compression.provider.HuffmanCodecProvider
 import net.rsprot.crypto.rsa.RsaKeyPair
-import net.rsprot.protocol.api.bootstrap.BootstrapFactory
+import net.rsprot.protocol.api.bootstrap.BootstrapBuilder
 import net.rsprot.protocol.api.handlers.ExceptionHandlers
 import net.rsprot.protocol.api.handlers.GameMessageHandlers
 import net.rsprot.protocol.api.handlers.INetAddressHandlers
@@ -24,9 +24,12 @@ import net.rsprot.protocol.game.outgoing.info.playerinfo.PlayerInfoProtocol
 import net.rsprot.protocol.game.outgoing.info.worldentityinfo.WorldEntityAvatarFactory
 import net.rsprot.protocol.game.outgoing.info.worldentityinfo.WorldEntityProtocol
 import net.rsprot.protocol.message.codec.incoming.provider.GameMessageConsumerRepositoryProvider
+import net.rsprot.protocol.metrics.NetworkTrafficMonitor
+import net.rsprot.protocol.threads.IllegalThreadAccessException
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ScheduledFuture
 import kotlin.time.measureTime
+import net.rsprot.protocol.common.setCommunicationThread as setInternalCommunicationThread
 
 /**
  * The primary network service implementation that brings all the necessary components together
@@ -35,7 +38,7 @@ import kotlin.time.measureTime
  * @property allocator the byte buffer allocator used throughout the library
  * @property ports the list of ports that the service will connect to
  * @property betaWorld whether this world is a beta world
- * @property bootstrapFactory the bootstrap factory used to configure the socket and Netty
+ * @property bootstrapBuilder the bootstrap builder used to configure the socket and Netty
  * @property entityInfoProtocols a wrapper object to bring together player and NPC info protocols
  * @property clientTypes the list of client types that were registered
  * @property gameConnectionHandler the handler for game logins and reconnections
@@ -65,6 +68,8 @@ import kotlin.time.measureTime
  * necessary to represent a NPC to the client
  * @property npcInfoProtocol the protocol responsible for tracking and computing everything related
  * to the NPC info packet for every player
+ * @property trafficMonitor a monitor for tracking network traffic, by default a no-op
+ * implementation that tracks nothing.
  */
 @Suppress("MemberVisibilityCanBePrivate")
 public class NetworkService<R>
@@ -72,7 +77,7 @@ public class NetworkService<R>
         internal val allocator: ByteBufAllocator,
         internal val ports: List<Int>,
         internal val betaWorld: Boolean,
-        internal val bootstrapFactory: BootstrapFactory,
+        internal val bootstrapBuilder: BootstrapBuilder,
         internal val entityInfoProtocols: EntityInfoProtocols,
         internal val clientTypes: List<OldSchoolClientType>,
         internal val gameConnectionHandler: GameConnectionHandler<R>,
@@ -82,12 +87,18 @@ public class NetworkService<R>
         internal val loginHandlers: LoginHandlers,
         public val huffmanCodecProvider: HuffmanCodecProvider,
         public val gameMessageConsumerRepositoryProvider: GameMessageConsumerRepositoryProvider<R>,
+        public val trafficMonitor: NetworkTrafficMonitor<*>,
         rsaKeyPair: RsaKeyPair,
         js5Configuration: Js5Configuration,
         js5GroupProvider: Js5GroupProvider,
     ) {
         internal val encoderRepositories: MessageEncoderRepositories = MessageEncoderRepositories(huffmanCodecProvider)
-        internal val js5Service: Js5Service = Js5Service(js5Configuration, js5GroupProvider)
+        internal val js5Service: Js5Service =
+            Js5Service(
+                this,
+                js5Configuration,
+                js5GroupProvider,
+            )
         private val js5ServiceExecutor = Thread(js5Service)
         internal val decoderRepositories: MessageDecoderRepositories =
             MessageDecoderRepositories.initialize(
@@ -119,14 +130,13 @@ public class NetworkService<R>
         public fun start() {
             val time =
                 measureTime {
-                    bossGroup = bootstrapFactory.createParentLoopGroup()
-                    childGroup = bootstrapFactory.createChildLoopGroup()
+                    val bootstrap = bootstrapBuilder.build()
                     val initializer =
-                        bootstrapFactory
-                            .createServerBootstrap(bossGroup, childGroup)
-                            .childHandler(
-                                LoginChannelInitializer(this),
-                            )
+                        bootstrap.childHandler(
+                            LoginChannelInitializer(this),
+                        )
+                    this.bossGroup = initializer.config().group()
+                    this.childGroup = initializer.config().childGroup()
                     val futures =
                         ports
                             .map(initializer::bind)
@@ -171,13 +181,30 @@ public class NetworkService<R>
         }
 
         /**
+         * Sets the thread which is permitted to communicate with RSProt's thread-unsafe
+         * properties. If set to null, all threads are allowed to communicate again.
+         * @param thread the thread permitted to communicate with RSProt's thread-unsafe functions.
+         * @param warnOnError whether to warn on a thread violation error. If false, am
+         * [IllegalThreadAccessException] is thrown instead.
+         */
+        @JvmOverloads
+        public fun setCommunicationThread(
+            thread: Thread?,
+            warnOnError: Boolean = true,
+        ) {
+            setInternalCommunicationThread(thread, warnOnError)
+        }
+
+        /**
          * Checks whether the provided [clientType] is supported by the service.
          */
         public fun isSupported(clientType: OldSchoolClientType): Boolean = clientType in clientTypes
 
         public companion object {
             public const val REVISION: Int = 225
-            public const val LOGIN_TIMEOUT_SECONDS: Long = 60
+            public const val INITIAL_TIMEOUT_SECONDS: Long = 30
+            public const val LOGIN_TIMEOUT_SECONDS: Long = 40
+            public const val GAME_TIMEOUT_SECONDS: Long = 15
             public const val JS5_TIMEOUT_SECONDS: Long = 30
             private val logger = InlineLogger()
         }

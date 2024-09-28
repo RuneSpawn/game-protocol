@@ -6,8 +6,8 @@ import com.github.michaelbull.logging.InlineLogger
 import io.netty.channel.ChannelFutureListener
 import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelPipeline
+import io.netty.handler.timeout.IdleStateHandler
 import net.rsprot.buffer.extensions.toJagByteBuf
-import net.rsprot.crypto.cipher.IsaacRandom
 import net.rsprot.crypto.cipher.StreamCipher
 import net.rsprot.crypto.cipher.StreamCipherPair
 import net.rsprot.protocol.api.NetworkService
@@ -22,6 +22,7 @@ import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.loginprot.incoming.util.LoginBlock
 import net.rsprot.protocol.loginprot.incoming.util.LoginClientType
 import net.rsprot.protocol.loginprot.outgoing.LoginResponse
+import java.util.concurrent.TimeUnit
 
 /**
  * A response handler for login requests, allowing the server to write either
@@ -53,6 +54,12 @@ public class GameLoginResponseHandler<R>(
             ctx
                 .writeAndFlush(LoginResponse.InvalidLoginPacket)
                 .addListener(ChannelFutureListener.CLOSE)
+            return null
+        }
+        if (!ctx.channel().isActive) {
+            networkLog(logger) {
+                "Channel '${ctx.channel()}' has gone inactive; login block: $loginBlock"
+            }
             return null
         }
         val address = ctx.inetAddress()
@@ -116,6 +123,12 @@ public class GameLoginResponseHandler<R>(
             ctx.writeAndFlush(LoginResponse.InvalidLoginPacket)
             return null
         }
+        if (!ctx.channel().isActive) {
+            networkLog(logger) {
+                "Channel '${ctx.channel()}' has gone inactive; login block: $loginBlock"
+            }
+            return null
+        }
         val (encodingCipher, decodingCipher) = createStreamCipherPair(loginBlock)
 
         // Unlike in the above case, we kind of have to assume it was successful
@@ -138,8 +151,9 @@ public class GameLoginResponseHandler<R>(
                 encodeSeed[index] + DECODE_SEED_OFFSET
             }
 
-        val encodingCipher = IsaacRandom(decodeSeed)
-        val decodingCipher = IsaacRandom(encodeSeed)
+        val provider = networkService.loginHandlers.streamCipherProvider
+        val encodingCipher = provider.provide(decodeSeed)
+        val decodingCipher = provider.provide(encodeSeed)
         return StreamCipherPair(encodingCipher, decodingCipher)
     }
 
@@ -162,6 +176,10 @@ public class GameLoginResponseHandler<R>(
         oldSchoolClientType: OldSchoolClientType,
         encodingCipher: StreamCipher,
     ): Session<R> {
+        val gameMessageConsumerRepository =
+            networkService
+                .gameMessageConsumerRepositoryProvider
+                .provide()
         val session =
             Session(
                 ctx,
@@ -176,10 +194,10 @@ public class GameLoginResponseHandler<R>(
                     .gameMessageHandlers
                     .gameMessageCounterProvider
                     .provide(),
-                networkService
-                    .gameMessageConsumerRepositoryProvider
-                    .provide()
+                gameMessageConsumerRepository
                     .consumers,
+                gameMessageConsumerRepository
+                    .globalConsumers,
                 loginBlock,
                 networkService
                     .exceptionHandlers
@@ -197,6 +215,15 @@ public class GameLoginResponseHandler<R>(
             GameMessageEncoder(networkService, encodingCipher, oldSchoolClientType),
         )
         pipeline.replace<LoginConnectionHandler<R>>(GameMessageHandler(networkService, session))
+        pipeline.replace<IdleStateHandler>(
+            IdleStateHandler(
+                true,
+                NetworkService.GAME_TIMEOUT_SECONDS,
+                NetworkService.GAME_TIMEOUT_SECONDS,
+                NetworkService.GAME_TIMEOUT_SECONDS,
+                TimeUnit.SECONDS,
+            ),
+        )
         return session
     }
 
@@ -214,6 +241,12 @@ public class GameLoginResponseHandler<R>(
         }
         if (response is LoginResponse.Successful) {
             throw IllegalStateException("Successful login response is handled at the engine level.")
+        }
+        if (!ctx.channel().isActive) {
+            networkLog(logger) {
+                "Channel '${ctx.channel()}' has gone inactive, skipping failed response."
+            }
+            return
         }
         networkLog(logger) {
             "Writing failed login response to channel '${ctx.channel()}': $response"

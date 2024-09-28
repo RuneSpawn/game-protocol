@@ -6,6 +6,8 @@ import net.rsprot.buffer.JagByteBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
@@ -18,8 +20,8 @@ import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
  * @property oldSchoolClientType the client type on which the player has logged in.
  * @property avatarRepository the avatar repository keeping track of every known
  * world entity in the root world.
- * @property indexSupplier the implementation returning all the indices of the world
- * entities near the local player.
+ * @property zoneIndexStorage the storage responsible for tracking the zones in which
+ * the world entities currently lie.
  * @property renderDistance the render distance in tiles, effectively how far to render
  * world entities from the local player (or the camera pov)
  * @property currentWorldEntityId the id of the world entity on which the local player
@@ -44,10 +46,6 @@ import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
  * and not necessarily the world itself. This allows the server to inform NPC and player info
  * protocol to deallocate the instances.
  * @property buffer the buffer for this world entity info packet.
- * @property builtIntoPacket whether the buffer has been built into a packet,
- * which means the responsibility of releasing the buffer falls to the server.
- * If false, the protocol will release the buffer when this instance is being
- * deallocated.
  * @property exception the exception that was caught during the computations
  * of this world entity info, if any. This will be thrown as the [toPacket]
  * function is called, allowing the server to handle it from the correct
@@ -57,13 +55,14 @@ import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
  * at which the world entity is being rendered on the root world. This allows the protocol
  * to still see other world entities nearby despite the player being in an instance.
  */
-@Suppress("MemberVisibilityCanBePrivate")
+@Suppress("MemberVisibilityCanBePrivate", "DuplicatedCode")
 public class WorldEntityInfo internal constructor(
     internal var localIndex: Int,
     internal val allocator: ByteBufAllocator,
     private var oldSchoolClientType: OldSchoolClientType,
     private val avatarRepository: WorldEntityAvatarRepository,
-    private val indexSupplier: WorldEntityIndexSupplier,
+    private val zoneIndexStorage: ZoneIndexStorage,
+    private val recycler: ByteBufRecycler = ByteBufRecycler(),
 ) : ReferencePooledObject {
     private var renderDistance: Int = DEFAULT_RENDER_DISTANCE
     private var currentWorldEntityId: Int = ROOT_WORLD
@@ -85,7 +84,6 @@ public class WorldEntityInfo internal constructor(
 
     @Volatile
     internal var exception: Exception? = null
-    private var builtIntoPacket: Boolean = false
     private var renderCoord: CoordGrid = CoordGrid.INVALID
 
     override fun isDestroyed(): Boolean = this.exception != null
@@ -224,7 +222,6 @@ public class WorldEntityInfo internal constructor(
                 exception,
             )
         }
-        builtIntoPacket = true
         return WorldEntityInfoPacket(backingBuffer())
     }
 
@@ -234,17 +231,10 @@ public class WorldEntityInfo internal constructor(
      * @return the buffer into which everything is written about this packet.
      */
     private fun allocBuffer(): ByteBuf {
-        // If a given player's packet was never sent out, we need to release the old buffer
-        if (!builtIntoPacket) {
-            val oldBuf = buffer
-            if (oldBuf != null && oldBuf.refCnt() > 0) {
-                oldBuf.release()
-            }
-        }
         // Acquire a new buffer with each cycle, in case the previous one isn't fully written out yet
         val buffer = allocator.buffer(BUF_CAPACITY, BUF_CAPACITY)
         this.buffer = buffer
-        this.builtIntoPacket = false
+        recycler += buffer
         this.addedWorldEntities.clear()
         this.removedWorldEntities.clear()
         return buffer
@@ -325,7 +315,7 @@ public class WorldEntityInfo internal constructor(
             return
         }
         val currentWorld = this.currentWorldEntityId
-        val (level, x, z) =
+        val (level, centerX, centerZ) =
             if (currentWorld == ROOT_WORLD) {
                 this.currentCoord
             } else {
@@ -333,40 +323,44 @@ public class WorldEntityInfo internal constructor(
                 // Perhaps center coord instead?
                 worldEntity.currentCoord
             }
-        val entities =
-            indexSupplier.supply(
-                this.localIndex,
-                level,
-                x,
-                z,
-                this.renderDistance,
-            )
-        while (entities.hasNext()) {
-            val index = entities.next() and 0xFFFF
-            if (index == 0xFFFF || isHighResolution(index)) {
-                continue
+        val startX = ((centerX - renderDistance) shr 3).coerceAtLeast(0)
+        val startZ = ((centerZ - renderDistance) shr 3).coerceAtLeast(0)
+        val endX = ((centerX + renderDistance) shr 3).coerceAtMost(0x7FF)
+        val endZ = ((centerZ + renderDistance) shr 3).coerceAtMost(0x7FF)
+        for (x in startX..endX) {
+            for (z in startZ..endZ) {
+                val npcs = this.zoneIndexStorage.get(level, x, z) ?: continue
+                for (k in 0..<npcs.size) {
+                    val index = npcs[k].toInt() and WORLDENTITY_LOOKUP_TERMINATOR
+                    if (index == WORLDENTITY_LOOKUP_TERMINATOR) {
+                        break
+                    }
+                    if (isHighResolution(index)) {
+                        continue
+                    }
+                    if (this.highResolutionIndicesCount >= MAX_HIGH_RES_COUNT) {
+                        break
+                    }
+                    val avatar = avatarRepository.getOrNull(index) ?: continue
+                    // Secondary build-area distance check
+                    if (!inRange(avatar)) {
+                        continue
+                    }
+                    addedWorldEntities += index
+                    allWorldEntities += index
+                    val i = highResolutionIndicesCount++
+                    highResolutionIndices[i] = index.toShort()
+                    buffer.p2(avatar.index)
+                    buffer.p1(avatar.sizeX)
+                    buffer.p1(avatar.sizeZ)
+                    val buildAreaCoord = buildArea.localize(avatar.currentCoord)
+                    buffer.p1(buildAreaCoord.xInBuildArea)
+                    buffer.p1(buildAreaCoord.zInBuildArea)
+                    buffer.p2(avatar.angle)
+                    // The zero is a currently unassigned property on all clients
+                    buffer.p2(0)
+                }
             }
-            if (this.highResolutionIndicesCount >= MAX_HIGH_RES_COUNT) {
-                break
-            }
-            val avatar = avatarRepository.getOrNull(index) ?: continue
-            // Secondary build-area distance check
-            if (!inRange(avatar)) {
-                continue
-            }
-            addedWorldEntities += index
-            allWorldEntities += index
-            val i = highResolutionIndicesCount++
-            highResolutionIndices[i] = index.toShort()
-            buffer.p2(avatar.index)
-            buffer.p1(avatar.sizeX)
-            buffer.p1(avatar.sizeZ)
-            val buildAreaCoord = buildArea.localize(avatar.currentCoord)
-            buffer.p1(buildAreaCoord.xInBuildArea)
-            buffer.p1(buildAreaCoord.zInBuildArea)
-            buffer.p2(avatar.angle)
-            // The zero is a currently unassigned property on all clients
-            buffer.p2(0)
         }
     }
 
@@ -438,7 +432,6 @@ public class WorldEntityInfo internal constructor(
         this.allWorldEntities.clear()
         this.addedWorldEntities.clear()
         this.removedWorldEntities.clear()
-        this.builtIntoPacket = false
         this.buffer = null
         this.exception = null
     }
@@ -447,15 +440,8 @@ public class WorldEntityInfo internal constructor(
      * Resets any existing world entity state, as a clean state is required.
      */
     public fun onReconnect() {
-        if (!builtIntoPacket) {
-            val buffer = this.buffer
-            if (buffer != null && buffer.refCnt() > 0) {
-                buffer.release(buffer.refCnt())
-            }
-            this.builtIntoPacket = false
-            this.buffer = null
-            this.exception = null
-        }
+        this.buffer = null
+        this.exception = null
         this.highResolutionIndicesCount = 0
         this.highResolutionIndices.fill(0)
         this.temporaryHighResolutionIndices.fill(0)
@@ -465,19 +451,20 @@ public class WorldEntityInfo internal constructor(
     }
 
     override fun onDealloc() {
-        if (!builtIntoPacket) {
-            val buffer = this.buffer
-            if (buffer != null && buffer.refCnt() > 0) {
-                buffer.release(buffer.refCnt())
-            }
-        }
+        this.buffer = null
     }
 
-    private companion object {
+    public companion object {
         /**
          * The index value that marks a termination for high resolution indices.
          */
         private const val INDEX_TERMINATOR: Short = -1
+
+        /**
+         * The terminator value that indicates that there are no more world entities in the
+         * corresponding zone.
+         */
+        private const val WORLDENTITY_LOOKUP_TERMINATOR: Int = 0xFFFF
 
         /**
          * The maximum number of high resolution world entities that could be sent.
@@ -487,7 +474,7 @@ public class WorldEntityInfo internal constructor(
         /**
          * The id of the root world.
          */
-        private const val ROOT_WORLD: Int = -1
+        public const val ROOT_WORLD: Int = -1
 
         /**
          * The default render distance for world entities.

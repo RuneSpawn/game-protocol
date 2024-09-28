@@ -1,8 +1,10 @@
 package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import net.rsprot.buffer.bitbuffer.UnsafeLongBackedBitBuf
+import net.rsprot.protocol.common.checkCommunicationThread
 import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
 import net.rsprot.protocol.common.game.outgoing.info.npcinfo.NpcAvatarDetails
+import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.npcinfo.util.NpcCellOpcodes
 import net.rsprot.protocol.game.outgoing.info.util.Avatar
 import java.util.concurrent.atomic.AtomicInteger
@@ -33,6 +35,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * @param spawnCycle the game cycle on which the npc spawned into the world;
  * for static NPCs, this would always be zero. This is only used by the C++ clients.
  * @param direction the direction that the npc will face on spawn (see table above)
+ * @property extendedInfo the extended info, commonly referred to as "masks", will track everything relevant
+ * inside itself. Setting properties such as a spotanim would be done through this.
+ * The [extendedInfo] is also responsible for caching the non-temporary blocks,
+ * such as appearance and move speed.
+ * @property zoneIndexStorage the storage tracking all the allocated game NPCs based on the zones.
  */
 public class NpcAvatar internal constructor(
     index: Int,
@@ -43,13 +50,8 @@ public class NpcAvatar internal constructor(
     spawnCycle: Int = 0,
     direction: Int = 0,
     allocateCycle: Int,
-    /**
-     * Extended info repository, commonly referred to as "masks", will track everything relevant
-     * inside itself. Setting properties such as a spotanim would be done through this.
-     * The [extendedInfo] is also responsible for caching the non-temporary blocks,
-     * such as appearance and move speed.
-     */
     public val extendedInfo: NpcAvatarExtendedInfo,
+    public val zoneIndexStorage: ZoneIndexStorage,
 ) : Avatar {
     /**
      * Npc avatar details class wraps all the client properties of a NPC in its own
@@ -149,6 +151,7 @@ public class NpcAvatar internal constructor(
      * @param direction the direction for the NPC to face.
      */
     public fun updateDirection(direction: Int) {
+        checkCommunicationThread()
         require(direction in 0..7) {
             "Direction must be a value in range of 0..7. " +
                 "See the table in documentation. Value: $direction"
@@ -162,6 +165,7 @@ public class NpcAvatar internal constructor(
      * @param id the id of the npc to set to - any new observers will see that id instead.
      */
     public fun setId(id: Int) {
+        checkCommunicationThread()
         require(id in 0..16383) {
             "Id must be a value in range of 0..16383. Value: $id"
         }
@@ -189,7 +193,10 @@ public class NpcAvatar internal constructor(
         z: Int,
         jump: Boolean,
     ) {
+        checkCommunicationThread()
+        zoneIndexStorage.remove(details.index, details.currentCoord)
         details.currentCoord = CoordGrid(level, x, z)
+        zoneIndexStorage.add(details.index, details.currentCoord)
         details.movementType = details.movementType or (if (jump) NpcAvatarDetails.TELEJUMP else NpcAvatarDetails.TELE)
     }
 
@@ -207,6 +214,7 @@ public class NpcAvatar internal constructor(
         deltaX: Int,
         deltaZ: Int,
     ) {
+        checkCommunicationThread()
         singleStepMovement(
             deltaX,
             deltaZ,
@@ -228,6 +236,7 @@ public class NpcAvatar internal constructor(
         deltaX: Int,
         deltaZ: Int,
     ) {
+        checkCommunicationThread()
         singleStepMovement(
             deltaX,
             deltaZ,
@@ -255,7 +264,9 @@ public class NpcAvatar internal constructor(
     ) {
         val opcode = NpcCellOpcodes.singleCellMovementOpcode(deltaX, deltaZ)
         val (level, x, z) = details.currentCoord
+        zoneIndexStorage.remove(details.index, details.currentCoord)
         details.currentCoord = CoordGrid(level, x + deltaX, z + deltaZ)
+        zoneIndexStorage.add(details.index, details.currentCoord)
         when (++details.stepCount) {
             1 -> {
                 details.firstStep = opcode
@@ -390,8 +401,22 @@ public class NpcAvatar internal constructor(
      * @param inaccessible whether the npc is inaccessible to all players (not rendered)
      */
     public fun setInaccessible(inaccessible: Boolean) {
+        checkCommunicationThread()
         details.inaccessible = inaccessible
     }
+
+    /**
+     * Checks whether a npc is actively observed by at least one player.
+     * @return true if the NPC has at least one player currently observing it via
+     * NPC info, false otherwise.
+     */
+    public fun isActive(): Boolean = observerCount.get() > 0
+
+    /**
+     * Checks the number of players that are currently observing this NPC avatar.
+     * @return the number of players that are observing this avatar.
+     */
+    public fun getObserverCount(): Int = observerCount.get()
 
     override fun postUpdate() {
         details.stepCount = 0

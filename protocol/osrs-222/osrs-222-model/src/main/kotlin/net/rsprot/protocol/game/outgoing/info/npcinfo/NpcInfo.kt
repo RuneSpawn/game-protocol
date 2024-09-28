@@ -9,6 +9,8 @@ import net.rsprot.protocol.common.client.ClientTypeMap
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
 import net.rsprot.protocol.common.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
+import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
@@ -26,10 +28,8 @@ import kotlin.contracts.contract
  * in the game.
  * @property oldSchoolClientType the client the player owning this npc info packet is on
  * @property localPlayerIndex the index of the local player that owns this npc info packet.
- * @property indexSupplier a supplier-style interface responsible for yielding npc indices
- * which are within vicinity of the player. This is the primary way the server will be providing
- * information about nearby NPCs to a player, as well as whether to render the NPC in the first place,
- * as some NPCs are meant to only render to a given player if certain conditions are met.
+ * @property zoneIndexStorage the zone index storage is used to look up the indices of NPCs near
+ * the player in an efficient manner.
  * @property lowResolutionToHighResolutionEncoders a client map of low resolution to high resolution
  * change encoders, used to move a npc into high resolution for the given player.
  * As this is scrambled, a separate client-specific implementation is required.
@@ -41,9 +41,10 @@ public class NpcInfo internal constructor(
     private val repository: NpcAvatarRepository,
     private var oldSchoolClientType: OldSchoolClientType,
     internal var localPlayerIndex: Int,
-    private val indexSupplier: NpcIndexSupplier,
+    private val zoneIndexStorage: ZoneIndexStorage,
     private val lowResolutionToHighResolutionEncoders: ClientTypeMap<NpcResolutionChangeEncoder>,
     private val detailsStorage: NpcInfoWorldDetailsStorage,
+    private val recycler: ByteBufRecycler,
 ) : ReferencePooledObject {
     /**
      * The maximum view distance how far a player will see other NPCs.
@@ -301,8 +302,6 @@ public class NpcInfo internal constructor(
                 exception,
             )
         }
-        val details = getDetails(worldId)
-        details.builtIntoPacket = true
         return if (this.viewDistance > MAX_SMALL_PACKET_DISTANCE) {
             NpcInfoLarge(backingBuffer(worldId))
         } else {
@@ -317,17 +316,10 @@ public class NpcInfo internal constructor(
     @Suppress("DuplicatedCode")
     private fun allocBuffer(worldId: Int): ByteBuf {
         val details = getDetails(worldId)
-        // If a given player's packet was never sent out, we need to release the old buffer
-        if (!details.builtIntoPacket) {
-            val oldBuf = details.buffer
-            if (oldBuf != null && oldBuf.refCnt() > 0) {
-                oldBuf.release()
-            }
-        }
         // Acquire a new buffer with each cycle, in case the previous one isn't fully written out yet
         val buffer = allocator.buffer(BUF_CAPACITY, BUF_CAPACITY)
         details.buffer = buffer
-        details.builtIntoPacket = false
+        recycler += buffer
         return buffer
     }
 
@@ -404,11 +396,12 @@ public class NpcInfo internal constructor(
         for (i in 0 until details.extendedInfoCount) {
             val index = details.extendedInfoIndices[i].toInt()
             val other = checkNotNull(repository.getOrNull(index))
-            val observerFlag = other.extendedInfo.flags or details.observerExtendedInfoFlags.getFlag(i)
+            val observerFlag = details.observerExtendedInfoFlags.getFlag(i) and 0xFF
             other.extendedInfo.pExtendedInfo(
                 oldSchoolClientType,
                 jagBuffer,
                 localPlayerIndex,
+                i,
                 details.extendedInfoCount - i,
                 observerFlag,
             )
@@ -568,52 +561,69 @@ public class NpcInfo internal constructor(
         buffer: BitBuf,
         viewDistance: Int,
     ) {
-        // If our local view is already maxed out, don't even request for indices
+        // If our local view is already maxed out, don't even bother calculating the below
         if (details.highResolutionNpcIndexCount >= MAX_HIGH_RESOLUTION_NPCS) {
             return
         }
         val encoder = lowResolutionToHighResolutionEncoders[oldSchoolClientType]
         val largeDistance = viewDistance > MAX_SMALL_PACKET_DISTANCE
-        val npcs =
-            this.indexSupplier.supply(
-                localPlayerIndex,
-                details.localPlayerCurrentCoord.level,
-                details.localPlayerCurrentCoord.x,
-                details.localPlayerCurrentCoord.z,
-                viewDistance,
-            )
-        while (npcs.hasNext()) {
-            val index = npcs.next() and NPC_INFO_CAPACITY
-            if (index == NPC_INFO_CAPACITY || isHighResolution(details, index)) {
-                continue
+        val coord = details.localPlayerCurrentCoord
+        val centerX = coord.x
+        val centerZ = coord.z
+        val level = coord.level
+        val startX = ((centerX - viewDistance) shr 3).coerceAtLeast(0)
+        val startZ = ((centerZ - viewDistance) shr 3).coerceAtLeast(0)
+        val endX = ((centerX + viewDistance) shr 3).coerceAtMost(0x7FF)
+        val endZ = ((centerZ + viewDistance) shr 3).coerceAtMost(0x7FF)
+        for (x in startX..endX) {
+            for (z in startZ..endZ) {
+                val npcs = this.zoneIndexStorage.get(level, x, z) ?: continue
+                for (k in 0..<npcs.size) {
+                    val index = npcs[k].toInt() and NPC_INFO_CAPACITY
+                    if (index == NPC_INFO_CAPACITY) {
+                        break
+                    }
+                    if (isHighResolution(details, index)) {
+                        continue
+                    }
+                    if (details.highResolutionNpcIndexCount >= MAX_HIGH_RESOLUTION_NPCS) {
+                        break
+                    }
+                    val avatar = repository.getOrNull(index) ?: continue
+                    if (avatar.details.inaccessible) {
+                        continue
+                    }
+                    if (!coord.inDistance(
+                            avatar.details.currentCoord,
+                            viewDistance,
+                        )
+                    ) {
+                        continue
+                    }
+                    if (!isInBuildArea(details, avatar)) {
+                        continue
+                    }
+                    avatar.addObserver()
+                    val i = details.highResolutionNpcIndexCount++
+                    details.highResolutionNpcIndices[i] = index.toUShort()
+                    val observerFlags = avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags()
+                    if (observerFlags != 0) {
+                        details.observerExtendedInfoFlags.addFlag(details.extendedInfoCount, observerFlags)
+                    }
+                    val extendedInfo = (avatar.extendedInfo.flags or observerFlags) != 0
+                    if (extendedInfo) {
+                        details.extendedInfoIndices[details.extendedInfoCount++] = index.toUShort()
+                    }
+                    encoder.encode(
+                        buffer,
+                        avatar.details,
+                        extendedInfo,
+                        coord,
+                        largeDistance,
+                        NpcInfoProtocol.cycleCount,
+                    )
+                }
             }
-            if (details.highResolutionNpcIndexCount >= MAX_HIGH_RESOLUTION_NPCS) {
-                break
-            }
-            val avatar = repository.getOrNull(index) ?: continue
-            if (avatar.details.inaccessible) {
-                continue
-            }
-            if (!isInBuildArea(details, avatar)) {
-                continue
-            }
-            avatar.addObserver()
-            val i = details.highResolutionNpcIndexCount++
-            details.highResolutionNpcIndices[i] = index.toUShort()
-            val observerFlags = avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags()
-            details.observerExtendedInfoFlags.addFlag(details.extendedInfoCount, observerFlags)
-            val extendedInfo = (avatar.extendedInfo.flags or observerFlags) != 0
-            if (extendedInfo) {
-                details.extendedInfoIndices[details.extendedInfoCount++] = index.toUShort()
-            }
-            encoder.encode(
-                buffer,
-                avatar.details,
-                extendedInfo,
-                details.localPlayerCurrentCoord,
-                largeDistance,
-                NpcInfoProtocol.cycleCount,
-            )
         }
     }
 
@@ -705,7 +715,7 @@ public class NpcInfo internal constructor(
         private const val WORLD_ENTITY_CAPACITY: Int = 2048
 
         /**
-         * The default capacity of the backing byte buffer into which all player info is written.
+         * The default capacity of the backing byte buffer into which all npc info is written.
          */
         private const val BUF_CAPACITY: Int = 40_000
 

@@ -6,6 +6,7 @@ import io.netty.buffer.ByteBufAllocator
 import net.rsprot.buffer.JagByteBuf
 import net.rsprot.compression.provider.HuffmanCodecProvider
 import net.rsprot.protocol.common.RSProtFlags
+import net.rsprot.protocol.common.checkCommunicationThread
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.common.game.outgoing.info.playerinfo.encoder.PlayerExtendedInfoEncoders
 import net.rsprot.protocol.common.game.outgoing.info.playerinfo.extendedinfo.FaceAngle
@@ -68,18 +69,18 @@ public class PlayerAvatarExtendedInfo(
         buildClientWriterArray(extendedInfoWriters)
 
     /**
-     * An int array to keep track of the number of times we've seen someone modify their appearance.
-     * During low to high resolution transition, if our counter of their changes does not align
-     * with their own counter of their appearance changes, their appearance will be re-transmitted
-     * to our client, in order to synchronize it. If the values align, the client will utilize its
-     * previously cached variant.
+     * An int array to track the last cycle during which we recorded other players' appearances.
+     * If the values align, the client will utilize its previously cached variant.
      */
-    private val otherAppearanceChangesCounter: IntArray = IntArray(PlayerInfoProtocol.PROTOCOL_CAPACITY)
+    private val otherAppearanceChangeCycles: IntArray =
+        IntArray(PlayerInfoProtocol.PROTOCOL_CAPACITY) {
+            -1
+        }
 
     /**
-     * The number of times our appearance has changed.
+     * The last player info cycle on which our appearance changed.
      */
-    private var appearanceChangesCounter: Int = 0
+    private var lastAppearanceChangeCycle: Int = 0
 
     /**
      * Sets the movement speed for this avatar. This move speed will be used whenever
@@ -97,6 +98,7 @@ public class PlayerAvatarExtendedInfo(
      * @param value the move speed value.
      */
     public fun setMoveSpeed(value: Int) {
+        checkCommunicationThread()
         verify {
             require(value in -1..2) {
                 "Unexpected move speed: $value, expected values: -1, 0, 1, 2"
@@ -122,6 +124,7 @@ public class PlayerAvatarExtendedInfo(
      * @param value the temporary move speed value.
      */
     public fun setTempMoveSpeed(value: Int) {
+        checkCommunicationThread()
         verify {
             require(value in -1..2 || value == 127) {
                 "Unexpected temporary move speed: $value, expected values: -1, 0, 1, 2, 127"
@@ -140,6 +143,7 @@ public class PlayerAvatarExtendedInfo(
         id: Int,
         delay: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(id == -1 || id in UNSIGNED_SHORT_RANGE) {
                 "Unexpected sequence id: $id, expected value -1 or in range $UNSIGNED_SHORT_RANGE"
@@ -161,6 +165,7 @@ public class PlayerAvatarExtendedInfo(
      * @param index the index of the target to face-lock onto (read above)
      */
     public fun setFacePathingEntity(index: Int) {
+        checkCommunicationThread()
         verify {
             require(index == -1 || index in 0..0x107FF) {
                 "Unexpected pathing entity index: $index, expected values: -1 to reset, " +
@@ -178,6 +183,7 @@ public class PlayerAvatarExtendedInfo(
      * between to get finer directions.
      */
     public fun setFaceAngle(angle: Int) {
+        checkCommunicationThread()
         verify {
             require(angle in 0..2047) {
                 "Unexpected angle: $angle, expected range: 0-2047"
@@ -196,6 +202,7 @@ public class PlayerAvatarExtendedInfo(
      * @param text the text to render overhead.
      */
     public fun setSay(text: String) {
+        checkCommunicationThread()
         verify {
             require(text.length <= 80) {
                 "Unexpected say input; expected value 80 characters or less, " +
@@ -255,6 +262,7 @@ public class PlayerAvatarExtendedInfo(
         text: String,
         pattern: ByteArray?,
     ) {
+        checkCommunicationThread()
         verify {
             require(text.length <= 80) {
                 "Unexpected chat input; expected value 80 characters or less, " +
@@ -316,6 +324,7 @@ public class PlayerAvatarExtendedInfo(
         delay2: Int,
         angle: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(delay1 >= 0) {
                 "First delay cannot be negative: $delay1"
@@ -366,6 +375,7 @@ public class PlayerAvatarExtendedInfo(
         delay: Int,
         height: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(slot in UNSIGNED_BYTE_RANGE) {
                 "Unexpected slot: $slot, expected range: $UNSIGNED_BYTE_RANGE"
@@ -409,6 +419,7 @@ public class PlayerAvatarExtendedInfo(
         value: Int,
         delay: Int = 0,
     ) {
+        checkCommunicationThread()
         if (blocks.hit.hitMarkList.size >= 0xFF) {
             return
         }
@@ -447,6 +458,7 @@ public class PlayerAvatarExtendedInfo(
      * @param delay the delay in client cycles (20ms/cc) until the hitmark is removed.
      */
     public fun removeHitMark(delay: Int = 0) {
+        checkCommunicationThread()
         if (blocks.hit.hitMarkList.size >= 0xFF) {
             return
         }
@@ -494,6 +506,7 @@ public class PlayerAvatarExtendedInfo(
         soakValue: Int,
         delay: Int = 0,
     ) {
+        checkCommunicationThread()
         if (blocks.hit.hitMarkList.size >= 0xFF) {
             return
         }
@@ -571,6 +584,7 @@ public class PlayerAvatarExtendedInfo(
         startTime: Int = 0,
         endTime: Int = 0,
     ) {
+        checkCommunicationThread()
         if (blocks.hit.headBarList.size >= 0xFF) {
             return
         }
@@ -644,6 +658,7 @@ public class PlayerAvatarExtendedInfo(
         lightness: Int,
         weight: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(startTime in UNSIGNED_SHORT_RANGE) {
                 "Unexpected startTime: $startTime, expected range $UNSIGNED_SHORT_RANGE"
@@ -697,6 +712,7 @@ public class PlayerAvatarExtendedInfo(
         weight: Int,
         visibleTo: PlayerInfo,
     ) {
+        checkCommunicationThread()
         verify {
             require(startTime in UNSIGNED_SHORT_RANGE) {
                 "Unexpected startTime: $startTime, expected range $UNSIGNED_SHORT_RANGE"
@@ -739,11 +755,7 @@ public class PlayerAvatarExtendedInfo(
      * @param name the name to assign.
      */
     public fun setName(name: String) {
-        verify {
-            require(name.length in 1..12) {
-                "Unexpected name length, expected range 1..12"
-            }
-        }
+        checkCommunicationThread()
         if (blocks.appearance.name == name) {
             return
         }
@@ -756,6 +768,7 @@ public class PlayerAvatarExtendedInfo(
      * @param combatLevel the level to assign.
      */
     public fun setCombatLevel(combatLevel: Int) {
+        checkCommunicationThread()
         verify {
             require(combatLevel in UNSIGNED_BYTE_RANGE) {
                 "Unexpected combatLevel $combatLevel, expected range $UNSIGNED_BYTE_RANGE"
@@ -775,6 +788,7 @@ public class PlayerAvatarExtendedInfo(
      * @param skillLevel the level to render
      */
     public fun setSkillLevel(skillLevel: Int) {
+        checkCommunicationThread()
         verify {
             require(skillLevel in UNSIGNED_SHORT_RANGE) {
                 "Unexpected skill level $skillLevel, expected range $UNSIGNED_SHORT_RANGE"
@@ -796,6 +810,7 @@ public class PlayerAvatarExtendedInfo(
      * @param hidden whether to hide the avatar.
      */
     public fun setHidden(hidden: Boolean) {
+        checkCommunicationThread()
         if (blocks.appearance.hidden == hidden) {
             return
         }
@@ -808,6 +823,7 @@ public class PlayerAvatarExtendedInfo(
      * @param isMale whether to set the character male (or female, if false)
      */
     public fun setMale(isMale: Boolean) {
+        checkCommunicationThread()
         if (blocks.appearance.male == isMale) {
             return
         }
@@ -821,6 +837,7 @@ public class PlayerAvatarExtendedInfo(
      * and 2 being 'other'.
      */
     public fun setTextGender(num: Int) {
+        checkCommunicationThread()
         verify {
             require(num in UNSIGNED_BYTE_RANGE) {
                 "Unexpected textGender $num, expected range $UNSIGNED_BYTE_RANGE"
@@ -839,6 +856,7 @@ public class PlayerAvatarExtendedInfo(
      * @param icon the id of the icon to render, or -1 to not show any.
      */
     public fun setSkullIcon(icon: Int) {
+        checkCommunicationThread()
         verify {
             require(icon == -1 || icon in UNSIGNED_BYTE_RANGE) {
                 "Unexpected skullIcon $icon, expected value -1 or in range $UNSIGNED_BYTE_RANGE"
@@ -857,6 +875,7 @@ public class PlayerAvatarExtendedInfo(
      * @param icon the id of the icon to render, or -1 to not show any.
      */
     public fun setOverheadIcon(icon: Int) {
+        checkCommunicationThread()
         verify {
             require(icon == -1 || icon in UNSIGNED_BYTE_RANGE) {
                 "Unexpected overheadIcon $icon, expected value -1 or in range $UNSIGNED_BYTE_RANGE"
@@ -875,6 +894,7 @@ public class PlayerAvatarExtendedInfo(
      * @param id the id of the NPC to transform to, or -1 if resetting.
      */
     public fun transformToNpc(id: Int) {
+        checkCommunicationThread()
         verify {
             require(id == -1 || id in UNSIGNED_SHORT_RANGE) {
                 "Unexpected id $id, expected value -1 or in range $UNSIGNED_SHORT_RANGE"
@@ -915,6 +935,7 @@ public class PlayerAvatarExtendedInfo(
         identKitSlot: Int,
         value: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(identKitSlot in 0..6) {
                 "Unexpected wearPos $identKitSlot, expected range 0..6"
@@ -947,6 +968,7 @@ public class PlayerAvatarExtendedInfo(
         wearpos2: Int,
         wearpos3: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearPos $wearpos, expected range 0..11"
@@ -981,6 +1003,7 @@ public class PlayerAvatarExtendedInfo(
         slot: Int,
         value: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(slot in 0..<5) {
                 "Unexpected slot $slot, expected range 0..<5"
@@ -1017,6 +1040,7 @@ public class PlayerAvatarExtendedInfo(
         walkAnimRight: Int,
         runAnim: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(readyAnim == -1 || readyAnim in UNSIGNED_SHORT_RANGE) {
                 "Unexpected readyAnim $readyAnim, expected value -1 or range $UNSIGNED_SHORT_RANGE"
@@ -1061,6 +1085,7 @@ public class PlayerAvatarExtendedInfo(
         afterName: String,
         afterCombatLevel: String,
     ) {
+        checkCommunicationThread()
         verify {
             require(beforeName.length in UNSIGNED_BYTE_RANGE) {
                 "Unexpected beforeName length ${beforeName.length}, expected range $UNSIGNED_BYTE_RANGE"
@@ -1084,6 +1109,7 @@ public class PlayerAvatarExtendedInfo(
      * as those are not considered when calculating the hash code.
      */
     public fun forceModelRefresh(enabled: Boolean) {
+        checkCommunicationThread()
         blocks.appearance.forceModelRefresh = enabled
     }
 
@@ -1092,6 +1118,7 @@ public class PlayerAvatarExtendedInfo(
      * @param wearpos the worn item slot.
      */
     public fun clearObjTypeCustomisation(wearpos: Int) {
+        checkCommunicationThread()
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearpos $wearpos, expected range 0..11"
@@ -1129,6 +1156,7 @@ public class PlayerAvatarExtendedInfo(
         index: Int,
         value: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearpos $wearpos, expected range 0..11"
@@ -1157,6 +1185,7 @@ public class PlayerAvatarExtendedInfo(
         index: Int,
         value: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearpos $wearpos, expected range 0..11"
@@ -1185,6 +1214,7 @@ public class PlayerAvatarExtendedInfo(
         index: Int,
         value: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearpos $wearpos, expected range 0..11"
@@ -1213,6 +1243,7 @@ public class PlayerAvatarExtendedInfo(
         index: Int,
         value: Int,
     ) {
+        checkCommunicationThread()
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearpos $wearpos, expected range 0..11"
@@ -1235,7 +1266,7 @@ public class PlayerAvatarExtendedInfo(
      */
     private fun flagAppearance() {
         flags = flags or APPEARANCE
-        appearanceChangesCounter++
+        lastAppearanceChangeCycle = PlayerInfoProtocol.cycleCount
     }
 
     /**
@@ -1253,8 +1284,8 @@ public class PlayerAvatarExtendedInfo(
      */
     internal fun reset() {
         flags = 0
-        this.appearanceChangesCounter = 0
-        this.otherAppearanceChangesCounter.fill(0)
+        this.lastAppearanceChangeCycle = 0
+        this.otherAppearanceChangeCycles.fill(-1)
         blocks.appearance.clear()
         blocks.moveSpeed.clear()
         blocks.temporaryMoveSpeed.clear()
@@ -1275,25 +1306,32 @@ public class PlayerAvatarExtendedInfo(
      * @param observer the avatar observing us.
      * @return the flags that need updating.
      */
-    internal fun getLowToHighResChangeExtendedInfoFlags(observer: PlayerAvatarExtendedInfo): Int {
+    internal fun getLowToHighResChangeExtendedInfoFlags(
+        observer: PlayerAvatarExtendedInfo,
+        oldSchoolClientType: OldSchoolClientType,
+    ): Int {
         var flag = 0
         if (this.flags and APPEARANCE == 0 &&
-            checkOutOfDate(observer)
+            checkOutOfDate(observer) &&
+            blocks.appearance.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or APPEARANCE
         }
         if (this.flags and MOVE_SPEED == 0 &&
-            blocks.moveSpeed.value != MoveSpeed.DEFAULT_MOVESPEED
+            blocks.moveSpeed.value != MoveSpeed.DEFAULT_MOVESPEED &&
+            blocks.moveSpeed.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or MOVE_SPEED
         }
         if (this.flags and FACE_PATHINGENTITY == 0 &&
-            blocks.facePathingEntity.index != FacePathingEntity.DEFAULT_VALUE
+            blocks.facePathingEntity.index != FacePathingEntity.DEFAULT_VALUE &&
+            blocks.facePathingEntity.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or FACE_PATHINGENTITY
         }
         if (this.flags and FACE_ANGLE == 0 &&
-            blocks.faceAngle.angle != FaceAngle.DEFAULT_VALUE
+            blocks.faceAngle.angle != FaceAngle.DEFAULT_VALUE &&
+            blocks.faceAngle.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or FACE_ANGLE
         }
@@ -1307,7 +1345,7 @@ public class PlayerAvatarExtendedInfo(
      * variant is still up-to-date.
      */
     private fun checkOutOfDate(observer: PlayerAvatarExtendedInfo): Boolean =
-        observer.otherAppearanceChangesCounter[localIndex] != appearanceChangesCounter
+        observer.otherAppearanceChangeCycles[localIndex] < lastAppearanceChangeCycle
 
     /**
      * Silently synchronizes the angle of the avatar, meaning any new observers will see them
@@ -1315,6 +1353,7 @@ public class PlayerAvatarExtendedInfo(
      * @param angle the angle to render them under.
      */
     public fun syncAngle(angle: Int) {
+        checkCommunicationThread()
         this.blocks.faceAngle.syncAngle(angle)
     }
 
@@ -1375,17 +1414,17 @@ public class PlayerAvatarExtendedInfo(
         observerFlag: Int,
         observer: PlayerAvatarExtendedInfo,
         remainingAvatars: Int,
-    ) {
+    ): Boolean {
         val flag = this.flags or observerFlag
         if (!filter.accept(
                 buffer.writableBytes(),
                 flag,
                 remainingAvatars,
-                observer.otherAppearanceChangesCounter[localIndex] != 0,
+                observer.otherAppearanceChangeCycles[localIndex] != -1,
             )
         ) {
             buffer.p1(0)
-            return
+            return false
         }
         val writer =
             requireNotNull(writers[oldSchoolClientType.id]) {
@@ -1394,7 +1433,7 @@ public class PlayerAvatarExtendedInfo(
 
         // If appearance is flagged, ensure we synchronize the changes counter
         if (flag and APPEARANCE != 0) {
-            observer.otherAppearanceChangesCounter[localIndex] = appearanceChangesCounter
+            observer.otherAppearanceChangeCycles[localIndex] = lastAppearanceChangeCycle
         }
         writer.pExtendedInfo(
             buffer,
@@ -1403,6 +1442,7 @@ public class PlayerAvatarExtendedInfo(
             flag,
             blocks,
         )
+        return true
     }
 
     /**
@@ -1440,7 +1480,8 @@ public class PlayerAvatarExtendedInfo(
      * so it will be updated whenever someone else takes their index.
      */
     public fun onOtherAvatarDeallocated(idx: Int) {
-        otherAppearanceChangesCounter[idx] = -1
+        checkCommunicationThread()
+        otherAppearanceChangeCycles[idx] = -1
     }
 
     public companion object {

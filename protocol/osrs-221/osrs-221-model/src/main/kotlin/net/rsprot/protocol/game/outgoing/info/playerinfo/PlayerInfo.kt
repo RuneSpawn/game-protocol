@@ -8,6 +8,7 @@ import net.rsprot.buffer.bitbuffer.toBitBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.ObserverExtendedInfoFlags
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.playerinfo.PlayerInfoProtocol.Companion.PROTOCOL_CAPACITY
@@ -49,6 +50,7 @@ public class PlayerInfo internal constructor(
     internal val allocator: ByteBufAllocator,
     private var oldSchoolClientType: OldSchoolClientType,
     public val avatar: PlayerAvatar,
+    private val recycler: ByteBufRecycler,
 ) : ReferencePooledObject {
     /**
      * Low resolution indices are tracked together with [lowResolutionCount].
@@ -80,6 +82,15 @@ public class PlayerInfo internal constructor(
      * At the end of each cycle, the [highResolutionIndices] are rebuilt to sort the indices.
      */
     private val highResolutionIndices: ShortArray = ShortArray(PROTOCOL_CAPACITY)
+
+    /**
+     * A bitset of high resolution players for whom we have written extended info.
+     * In the case of someone being added to high resolution, but due to our buffer being too
+     * full to actually write their extended info, we need to try again the next tick (and so on)
+     * until we finally succeed in synchronizing them. Without this, one could end up with invisible
+     * players.
+     */
+    private val highResolutionExtendedInfoTrackedPlayers: LongArray = LongArray(PROTOCOL_CAPACITY ushr 6)
 
     /**
      * The number of players in high resolution according to the protocol.
@@ -154,15 +165,6 @@ public class PlayerInfo internal constructor(
     internal var exception: Exception? = null
 
     /**
-     * Whether the buffer allocated by this player info object has been built
-     * into a packet message. If this returns false, but player info was in fact built,
-     * we have an allocated buffer that needs releasing. If the NPC info itself
-     * is released but isn't built into packet, we make sure to release it, to avoid
-     * any memory leaks.
-     */
-    private var builtIntoPacket: Boolean = false
-
-    /**
      * The entire build area of this world - this effectively caps what we can see
      * to be within this block of land. Anything outside will be excluded.
      */
@@ -173,7 +175,7 @@ public class PlayerInfo internal constructor(
      * @throws IllegalStateException if the buffer has not been allocated yet.
      */
     @Throws(IllegalStateException::class)
-    public fun backingBuffer(): ByteBuf = checkNotNull(buffer)
+    private fun backingBuffer(): ByteBuf = checkNotNull(buffer)
 
     override fun isDestroyed(): Boolean = this.exception != null
 
@@ -207,6 +209,34 @@ public class PlayerInfo internal constructor(
     }
 
     /**
+     * Gets the high resolution indices in a new arraylist of integers.
+     * The list is initialized to an initial capacity equal to the high resolution player index count.
+     * @return the newly created arraylist of indices
+     */
+    public fun getHighResolutionIndices(): ArrayList<Int> {
+        val collection = ArrayList<Int>(highResolutionCount)
+        for (i in 0..<highResolutionCount) {
+            val index = highResolutionIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
+     * Appends the high resolution indices to the provided [collection]. This can be used to determine which players the
+     * player is currently seeing in the client.
+     * @param collection the mutable collection of integer indices to append the indices into.
+     * @return the provided [collection] to chaining.
+     */
+    public fun <T> appendHighResolutionIndices(collection: T): T where T : MutableCollection<Int> {
+        for (i in 0..<highResolutionCount) {
+            val index = highResolutionIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
      * Turns the player info object into a wrapped packet.
      * This is necessary because the encoder itself is only triggered in Netty, and it is possible
      * that the buffer has already been replaced with a new variant before it gets to that stage.
@@ -222,7 +252,6 @@ public class PlayerInfo internal constructor(
                 exception,
             )
         }
-        this.builtIntoPacket = true
         return PlayerInfoPacket(backingBuffer())
     }
 
@@ -244,12 +273,20 @@ public class PlayerInfo internal constructor(
         this.avatar.updateCoord(level, x, z)
     }
 
+    /**
+     * Checks whether the player at [index] is currently among high resolution players.
+     * @param index the index of the player to check.
+     */
     private fun isHighResolution(index: Int): Boolean {
         val longIndex = index ushr 6
         val bit = 1L shl (index and 0x3F)
         return this.highResolutionPlayers[longIndex] and bit != 0L
     }
 
+    /**
+     * Marks the player at index [index] as being in high resolution.
+     * @param index the index of the player to mark as high resolution.
+     */
     private fun setHighResolution(index: Int) {
         val longIndex = index ushr 6
         val bit = 1L shl (index and 0x3F)
@@ -257,11 +294,47 @@ public class PlayerInfo internal constructor(
         this.highResolutionPlayers[longIndex] = cur or bit
     }
 
+    /**
+     * Marks the player at index [index] as being in low resolution.
+     * @param index the index of the player to mark as low resolution.
+     */
     private fun unsetHighResolution(index: Int) {
         val longIndex = index ushr 6
         val bit = 1L shl (index and 0x3F)
         val cur = this.highResolutionPlayers[longIndex]
         this.highResolutionPlayers[longIndex] = cur and bit.inv()
+    }
+
+    /**
+     * Checks whether the player at [index] is currently among high resolution extended info players.
+     * @param index the index of the player to check.
+     */
+    private fun isHighResolutionExtendedInfoTracked(index: Int): Boolean {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        return this.highResolutionExtendedInfoTrackedPlayers[longIndex] and bit != 0L
+    }
+
+    /**
+     * Marks the player at index [index] as being in high resolution extended info.
+     * @param index the index of the player to mark as high resolution.
+     */
+    private fun setHighResolutionExtendedInfoTracked(index: Int) {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        val cur = this.highResolutionExtendedInfoTrackedPlayers[longIndex]
+        this.highResolutionExtendedInfoTrackedPlayers[longIndex] = cur or bit
+    }
+
+    /**
+     * Marks the player at index [index] as being in low resolution extended info.
+     * @param index the index of the player to mark as low resolution.
+     */
+    private fun unsetHighResolutionExtendedInfoTracked(index: Int) {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        val cur = this.highResolutionExtendedInfoTrackedPlayers[longIndex]
+        this.highResolutionExtendedInfoTrackedPlayers[longIndex] = cur and bit.inv()
     }
 
     /**
@@ -296,15 +369,6 @@ public class PlayerInfo internal constructor(
      * Cached state should be re-assigned from the server as a result of this.
      */
     public fun onReconnect() {
-        // If player info was constructed, but it was not built into a packet object
-        // it implies the packet is never being written to Netty, which means
-        // a memory leak is occurring - if that is the case, release the buffer here
-        if (!builtIntoPacket) {
-            val buffer = this.buffer
-            if (buffer != null && buffer.refCnt() > 0) {
-                buffer.release(buffer.refCnt())
-            }
-        }
         this.buffer = null
         highResMovementBuffer = null
         lowResMovementBuffer = null
@@ -314,6 +378,7 @@ public class PlayerInfo internal constructor(
         highResolutionIndices.fill(0)
         highResolutionCount = 0
         highResolutionPlayers.fill(0L)
+        highResolutionExtendedInfoTrackedPlayers.fill(0L)
         extendedInfoCount = 0
         extendedInfoIndices.fill(0)
         stationary.fill(0)
@@ -356,13 +421,17 @@ public class PlayerInfo internal constructor(
             val index = extendedInfoIndices[i].toInt()
             val other = checkNotNull(protocol.getPlayerInfo(index))
             val observerFlag = observerExtendedInfoFlags.getFlag(index)
-            other.avatar.extendedInfo.pExtendedInfo(
-                oldSchoolClientType,
-                jagBuffer,
-                observerFlag,
-                avatar.extendedInfo,
-                extendedInfoCount - i,
-            )
+            val tracked =
+                other.avatar.extendedInfo.pExtendedInfo(
+                    oldSchoolClientType,
+                    jagBuffer,
+                    observerFlag,
+                    avatar.extendedInfo,
+                    extendedInfoCount - i,
+                )
+            if (tracked) {
+                setHighResolutionExtendedInfoTracked(index)
+            }
         }
     }
 
@@ -452,7 +521,11 @@ public class PlayerInfo internal constructor(
         buffer.pBits(13, z)
 
         // Get a flags of all the extended info blocks that are 'outdated' to us and must be sent again.
-        val extraFlags = other.avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags(avatar.extendedInfo)
+        val extraFlags =
+            other.avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags(
+                avatar.extendedInfo,
+                oldSchoolClientType,
+            )
         // Mark those flags as observer-dependent.
         observerExtendedInfoFlags.addFlag(index, extraFlags)
         stationary[index] = (stationary[index].toInt() or IS_STATIONARY).toByte()
@@ -463,6 +536,7 @@ public class PlayerInfo internal constructor(
             extendedInfoIndices[extendedInfoCount++] = index.toShort()
             buffer.pBits(1, 1)
         } else {
+            setHighResolutionExtendedInfoTracked(index)
             buffer.pBits(1, 0)
         }
     }
@@ -494,8 +568,20 @@ public class PlayerInfo internal constructor(
                 continue
             }
 
+            // If we still haven't tracked extended info for them, re-try
+            if (!isHighResolutionExtendedInfoTracked(index)) {
+                val extraFlags =
+                    other.avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags(
+                        avatar.extendedInfo,
+                        oldSchoolClientType,
+                    )
+                observerExtendedInfoFlags.addFlag(index, extraFlags)
+            }
             val flag = other.avatar.extendedInfo.flags or observerExtendedInfoFlags.getFlag(index)
             val hasExtendedInfoBlock = flag != 0
+            if (!hasExtendedInfoBlock) {
+                setHighResolutionExtendedInfoTracked(index)
+            }
             val highResBuf = other.highResMovementBuffer
             val skipped = !hasExtendedInfoBlock && highResBuf == null
             if (!skipped) {
@@ -595,6 +681,7 @@ public class PlayerInfo internal constructor(
         other: PlayerInfo?,
     ) {
         unsetHighResolution(index)
+        unsetHighResolutionExtendedInfoTracked(index)
         // The one-liner pBits is equal to the below comment:
         // buffer.pBits(1, 1)
         // buffer.pBits(1, 0)
@@ -682,17 +769,10 @@ public class PlayerInfo internal constructor(
      * The old [buffer] will not be released, as that is the duty of the encoder class.
      */
     private fun allocBuffer(): ByteBuf {
-        // If a given player's packet was never sent out, we need to release the old buffer
-        if (!builtIntoPacket) {
-            val oldBuf = buffer
-            if (oldBuf != null && oldBuf.refCnt() > 0) {
-                oldBuf.release()
-            }
-        }
         // Acquire a new buffer with each cycle, in case the previous one isn't fully written out yet
         val buffer = allocator.buffer(BUF_CAPACITY, BUF_CAPACITY)
         this.buffer = buffer
-        this.builtIntoPacket = false
+        recycler += buffer
         return buffer
     }
 
@@ -742,10 +822,12 @@ public class PlayerInfo internal constructor(
         highResolutionIndices.fill(0)
         highResolutionCount = 0
         highResolutionPlayers.fill(0L)
+        highResolutionExtendedInfoTrackedPlayers.fill(0L)
         extendedInfoCount = 0
         extendedInfoIndices.fill(0)
         stationary.fill(0)
         observerExtendedInfoFlags.reset()
+        this.buffer = null
     }
 
     /**
@@ -753,15 +835,6 @@ public class PlayerInfo internal constructor(
      * to stick around for extended periods of time. Any primitive properties will remain untouched.
      */
     override fun onDealloc() {
-        // If player info was constructed, but it was not built into a packet object
-        // it implies the packet is never being written to Netty, which means
-        // a memory leak is occurring - if that is the case, release the buffer here
-        if (!builtIntoPacket) {
-            val buffer = this.buffer
-            if (buffer != null && buffer.refCnt() > 0) {
-                buffer.release(buffer.refCnt())
-            }
-        }
         this.buffer = null
         avatar.extendedInfo.reset()
         highResMovementBuffer = null

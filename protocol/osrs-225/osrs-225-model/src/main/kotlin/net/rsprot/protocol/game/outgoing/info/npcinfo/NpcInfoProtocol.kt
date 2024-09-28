@@ -2,9 +2,12 @@ package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import com.github.michaelbull.logging.InlineLogger
 import io.netty.buffer.ByteBufAllocator
+import net.rsprot.protocol.common.checkCommunicationThread
 import net.rsprot.protocol.common.client.ClientTypeMap
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.common.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
+import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.worker.DefaultProtocolWorker
 import net.rsprot.protocol.game.outgoing.info.worker.ProtocolWorker
 import java.util.concurrent.Callable
@@ -13,25 +16,26 @@ import java.util.concurrent.Callable
  * NPC info protocol is the root class bringing everything together about NPC info.
  * @property allocator the byte buffer allocator used for pre-computing bit codes and
  * extended info blocks.
- * @property npcIndexSupplier the interface that supplies indices of NPCs near the player
- * that need to be added to the high resolution view.
  * @property resolutionChangeEncoders a client-specific map of resolution change encoders,
  * as the low to high resolution change is scrambled between clients and revision,
  * it needs to be supplied by the respective client module.
  * @param avatarFactory the factory responsible for allocating new npc avatars.
  * @property worker the protocol worker used to execute the jobs involved with
  * npc info computations.
+ * @property zoneIndexStorage the zone index storage is responsible for tracking all the NPCs
+ * currently spawned into the game.
  */
 @Suppress("DuplicatedCode")
 public class NpcInfoProtocol(
     private val allocator: ByteBufAllocator,
-    private val npcIndexSupplier: NpcIndexSupplier,
     private val resolutionChangeEncoders: ClientTypeMap<NpcResolutionChangeEncoder>,
     avatarFactory: NpcAvatarFactory,
     private val exceptionHandler: NpcAvatarExceptionHandler,
     private val worker: ProtocolWorker = DefaultProtocolWorker(),
+    private val zoneIndexStorage: ZoneIndexStorage,
 ) {
     private val detailsStorage: NpcInfoWorldDetailsStorage = NpcInfoWorldDetailsStorage()
+    private val recycler: ByteBufRecycler = ByteBufRecycler()
 
     /**
      * The avatar repository keeps track of all the avatars currently in the game.
@@ -49,9 +53,10 @@ public class NpcInfoProtocol(
                 avatarRepository,
                 clientType,
                 localIndex,
-                npcIndexSupplier,
+                zoneIndexStorage,
                 resolutionChangeEncoders,
                 detailsStorage,
+                recycler,
             )
         }
 
@@ -70,7 +75,10 @@ public class NpcInfoProtocol(
     public fun alloc(
         idx: Int,
         oldSchoolClientType: OldSchoolClientType,
-    ): NpcInfo = npcInfoRepository.alloc(idx, oldSchoolClientType)
+    ): NpcInfo {
+        checkCommunicationThread()
+        return npcInfoRepository.alloc(idx, oldSchoolClientType)
+    }
 
     /**
      * Deallocates the provided npc info object, allowing it to be used up
@@ -78,6 +86,7 @@ public class NpcInfoProtocol(
      * @param info the npc info object to deallocate
      */
     public fun dealloc(info: NpcInfo) {
+        checkCommunicationThread()
         // Prevent returning a destroyed npc info object back into the pool
         if (info.isDestroyed()) {
             return
@@ -92,7 +101,10 @@ public class NpcInfoProtocol(
      * @throws IllegalStateException if the npc info is null at that index
      * @throws ArrayIndexOutOfBoundsException if the index is out of bounds
      */
-    public operator fun get(idx: Int): NpcInfo = npcInfoRepository[idx]
+    public operator fun get(idx: Int): NpcInfo {
+        checkCommunicationThread()
+        return npcInfoRepository[idx]
+    }
 
     /**
      * Updates the npc info protocol for this cycle.
@@ -100,11 +112,13 @@ public class NpcInfoProtocol(
      * allowing multithreaded execution if selected.
      */
     public fun update() {
+        checkCommunicationThread()
         prepareBitcodes()
         putBitcodes()
         prepareExtendedInfo()
         putExtendedInfo()
         postUpdate()
+        recycler.cycle()
         cycleCount++
     }
 

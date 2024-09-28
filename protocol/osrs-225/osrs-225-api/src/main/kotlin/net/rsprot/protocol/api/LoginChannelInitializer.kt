@@ -23,12 +23,13 @@ public class LoginChannelInitializer<R>(
         networkLog(logger) {
             "Channel initialized: $ch"
         }
+        networkService.trafficMonitor.incrementConnections()
         ch.pipeline().addLast(
             IdleStateHandler(
                 true,
-                NetworkService.LOGIN_TIMEOUT_SECONDS,
-                NetworkService.LOGIN_TIMEOUT_SECONDS,
-                NetworkService.LOGIN_TIMEOUT_SECONDS,
+                NetworkService.INITIAL_TIMEOUT_SECONDS,
+                NetworkService.INITIAL_TIMEOUT_SECONDS,
+                NetworkService.INITIAL_TIMEOUT_SECONDS,
                 TimeUnit.SECONDS,
             ),
             LoginMessageDecoder(networkService),

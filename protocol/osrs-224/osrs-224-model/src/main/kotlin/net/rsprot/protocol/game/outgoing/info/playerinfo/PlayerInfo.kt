@@ -8,6 +8,7 @@ import net.rsprot.buffer.bitbuffer.toBitBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.ObserverExtendedInfoFlags
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.playerinfo.PlayerInfoProtocol.Companion.PROTOCOL_CAPACITY
@@ -49,6 +50,7 @@ public class PlayerInfo internal constructor(
     internal val allocator: ByteBufAllocator,
     private var oldSchoolClientType: OldSchoolClientType,
     public val avatar: PlayerAvatar,
+    private val recycler: ByteBufRecycler = ByteBufRecycler(),
 ) : ReferencePooledObject {
     /**
      * The observer info flags are used for us to track extended info blocks which weren't necessarily
@@ -253,18 +255,97 @@ public class PlayerInfo internal constructor(
     }
 
     /**
-     * Returns the backing buffer for this cycle, for the specified [worldId].
-     * @throws IllegalStateException if the buffer has not been allocated yet.
+     * Gets the world details implementation of the specified [worldId], or null if the
+     * world has not been allocated.
      */
-    @Throws(IllegalStateException::class)
-    public fun backingBuffer(worldId: Int): ByteBuf = checkNotNull(getDetails(worldId).buffer)
+    private fun getDetailsOrNull(worldId: Int): PlayerInfoWorldDetails? =
+        if (worldId == ROOT_WORLD) {
+            details[PROTOCOL_CAPACITY]
+        } else {
+            details.getOrNull(worldId)
+        }
 
     /**
      * Returns the backing buffer for this cycle, for the specified world details.
      * @throws IllegalStateException if the buffer has not been allocated yet.
      */
     @Throws(IllegalStateException::class)
-    internal fun backingBuffer(details: PlayerInfoWorldDetails): ByteBuf = checkNotNull(details.buffer)
+    private fun backingBuffer(details: PlayerInfoWorldDetails): ByteBuf = checkNotNull(details.buffer)
+
+    /**
+     * Gets the high resolution indices of the given [worldId] in a new arraylist of integers.
+     * The list is initialized to an initial capacity equal to the high resolution player index count.
+     * @param worldId the worldId to collect the indices from. For root world, use [ROOT_WORLD].
+     * @throws IllegalArgumentException if the world id is not in range of 0..<2048, or [ROOT_WORLD].
+     * @throws IllegalStateException if the provided world has not been allocated. It is up to the
+     * caller to ensure the world they're accessible is available. Root world will always be available
+     * as long as the given info object is allocated.
+     * @return the newly created arraylist of indices
+     */
+    public fun getHighResolutionIndices(worldId: Int): ArrayList<Int> {
+        val details = getDetails(worldId)
+        val collection = ArrayList<Int>(details.highResolutionCount)
+        for (i in 0..<details.highResolutionCount) {
+            val index = details.highResolutionIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
+     * Gets the high resolution indices of the given [worldId] in a new arraylist of integers, or null
+     * if the provided world does not exist.
+     * The list is initialized to an initial capacity equal to the high resolution player index count.
+     * @param worldId the worldId to collect the indices from. For root world, use [ROOT_WORLD].
+     * @throws IllegalArgumentException if the world id is not in range of 0..<2048, or [ROOT_WORLD].
+     * @throws IllegalStateException if the provided world has not been allocated. It is up to the
+     * caller to ensure the world they're accessible is available. Root world will always be available
+     * as long as the given info object is allocated.
+     * @return the newly created arraylist of indices, or null if the world does not exist.
+     */
+    public fun getHighResolutionIndicesOrNull(worldId: Int): ArrayList<Int>? {
+        val details = getDetailsOrNull(worldId) ?: return null
+        val collection = ArrayList<Int>(details.highResolutionCount)
+        for (i in 0..<details.highResolutionCount) {
+            val index = details.highResolutionIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
+
+    /**
+     * Appends the high resolution indices of the given [worldId] to the provided
+     * [collection]. This can be used to determine which players the player is currently
+     * seeing in the client.
+     * @param worldId the worldId to collect the indices from. For root world, use [ROOT_WORLD].
+     * @param collection the mutable collection of integer indices to append the indices into.
+     * @param throwExceptionIfNoWorld whether to throw an exception if the world does not exist.
+     * @throws IllegalArgumentException if the world id is not in range of 0..<2048, or [ROOT_WORLD],
+     * as long as [throwExceptionIfNoWorld] is true.
+     * @throws IllegalStateException if the provided world has not been allocated. It is up to the
+     * caller to ensure the world they're accessible is available. Root world will always be available
+     * as long as the given info object is allocated. This will only be thrown if [throwExceptionIfNoWorld]
+     * is true.
+     * @return the provided [collection] to chaining.
+     */
+    @JvmOverloads
+    public fun <T> appendHighResolutionIndices(
+        worldId: Int,
+        collection: T,
+        throwExceptionIfNoWorld: Boolean = true,
+    ): T where T : MutableCollection<Int> {
+        val details =
+            if (throwExceptionIfNoWorld) {
+                getDetails(worldId)
+            } else {
+                getDetailsOrNull(worldId) ?: return collection
+            }
+        for (i in 0..<details.highResolutionCount) {
+            val index = details.highResolutionIndices[i].toInt()
+            collection.add(index)
+        }
+        return collection
+    }
 
     /**
      * Turns the player info object into a wrapped packet.
@@ -283,7 +364,6 @@ public class PlayerInfo internal constructor(
                 exception,
             )
         }
-        details.builtIntoPacket = true
         return PlayerInfoPacket(backingBuffer(details))
     }
 
@@ -347,6 +427,50 @@ public class PlayerInfo internal constructor(
         val bit = 1L shl (index and 0x3F)
         val cur = highResolutionPlayers[longIndex]
         highResolutionPlayers[longIndex] = cur and bit.inv()
+    }
+
+    /**
+     * Checks whether the player at [index] is currently among high resolution extended info players.
+     * @param highResolutionExtendedInfoTrackedPlayers a bitpacked long array containing boolean-type information.
+     * @param index the index of the player to check.
+     */
+    private fun isHighResolutionExtendedInfoTracked(
+        highResolutionExtendedInfoTrackedPlayers: LongArray,
+        index: Int,
+    ): Boolean {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        return highResolutionExtendedInfoTrackedPlayers[longIndex] and bit != 0L
+    }
+
+    /**
+     * Marks the player at index [index] as being in high resolution extended info.
+     * @param highResolutionExtendedInfoTrackedPlayers a bitpacked long array containing boolean-type information.
+     * @param index the index of the player to mark as high resolution.
+     */
+    private fun setHighResolutionExtendedInfoTracked(
+        highResolutionExtendedInfoTrackedPlayers: LongArray,
+        index: Int,
+    ) {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        val cur = highResolutionExtendedInfoTrackedPlayers[longIndex]
+        highResolutionExtendedInfoTrackedPlayers[longIndex] = cur or bit
+    }
+
+    /**
+     * Marks the player at index [index] as being in low resolution extended info.
+     * @param highResolutionExtendedInfoTrackedPlayers a bitpacked long array containing boolean-type information.
+     * @param index the index of the player to mark as low resolution.
+     */
+    private fun unsetHighResolutionExtendedInfoTracked(
+        highResolutionExtendedInfoTrackedPlayers: LongArray,
+        index: Int,
+    ) {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        val cur = highResolutionExtendedInfoTrackedPlayers[longIndex]
+        highResolutionExtendedInfoTrackedPlayers[longIndex] = cur and bit.inv()
     }
 
     /**
@@ -425,13 +549,20 @@ public class PlayerInfo internal constructor(
             val index = details.extendedInfoIndices[i].toInt()
             val other = checkNotNull(protocol.getPlayerInfo(index))
             val observerFlag = observerExtendedInfoFlags.getFlag(index)
-            other.avatar.extendedInfo.pExtendedInfo(
-                oldSchoolClientType,
-                jagBuffer,
-                observerFlag,
-                avatar.extendedInfo,
-                details.extendedInfoCount - i,
-            )
+            val tracked =
+                other.avatar.extendedInfo.pExtendedInfo(
+                    oldSchoolClientType,
+                    jagBuffer,
+                    observerFlag,
+                    avatar.extendedInfo,
+                    details.extendedInfoCount - i,
+                )
+            if (tracked) {
+                setHighResolutionExtendedInfoTracked(
+                    details.highResolutionExtendedInfoTrackedPlayers,
+                    index,
+                )
+            }
         }
     }
 
@@ -523,7 +654,11 @@ public class PlayerInfo internal constructor(
         buffer.pBits(13, z)
 
         // Get a flags of all the extended info blocks that are 'outdated' to us and must be sent again.
-        val extraFlags = other.avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags(avatar.extendedInfo)
+        val extraFlags =
+            other.avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags(
+                avatar.extendedInfo,
+                oldSchoolClientType,
+            )
         // Mark those flags as observer-dependent.
         observerExtendedInfoFlags.addFlag(index, extraFlags)
         details.stationary[index] = (details.stationary[index].toInt() or IS_STATIONARY).toByte()
@@ -534,6 +669,10 @@ public class PlayerInfo internal constructor(
             details.extendedInfoIndices[details.extendedInfoCount++] = index.toShort()
             buffer.pBits(1, 1)
         } else {
+            setHighResolutionExtendedInfoTracked(
+                details.highResolutionExtendedInfoTrackedPlayers,
+                index,
+            )
             buffer.pBits(1, 0)
         }
     }
@@ -566,10 +705,22 @@ public class PlayerInfo internal constructor(
                 continue
             }
 
+            // If we still haven't tracked extended info for them, re-try
+            if (!isHighResolutionExtendedInfoTracked(details.highResolutionExtendedInfoTrackedPlayers, index)) {
+                val extraFlags =
+                    other.avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags(
+                        avatar.extendedInfo,
+                        oldSchoolClientType,
+                    )
+                observerExtendedInfoFlags.addFlag(index, extraFlags)
+            }
             val flag = other.avatar.extendedInfo.flags or observerExtendedInfoFlags.getFlag(index)
             val hasExtendedInfoBlock =
                 flag != 0 &&
                     (details.worldId == activeWorldId || index != localIndex)
+            if (!hasExtendedInfoBlock) {
+                setHighResolutionExtendedInfoTracked(details.highResolutionExtendedInfoTrackedPlayers, index)
+            }
             val highResBuf = other.highResMovementBuffer
             val skipped = !hasExtendedInfoBlock && (!details.initialized || highResBuf == null)
             if (!skipped) {
@@ -671,6 +822,7 @@ public class PlayerInfo internal constructor(
         other: PlayerInfo?,
     ) {
         unsetHighResolution(details.highResolutionPlayers, index)
+        unsetHighResolutionExtendedInfoTracked(details.highResolutionExtendedInfoTrackedPlayers, index)
         // The one-liner pBits is equal to the below comment:
         // buffer.pBits(1, 1)
         // buffer.pBits(1, 0)
@@ -764,17 +916,10 @@ public class PlayerInfo internal constructor(
      * The old [PlayerInfoWorldDetails.buffer] will not be released, as that is the duty of the encoder class.
      */
     private fun allocBuffer(details: PlayerInfoWorldDetails): ByteBuf {
-        // If a given player's packet was never sent out, we need to release the old buffer
-        if (!details.builtIntoPacket) {
-            val oldBuf = details.buffer
-            if (oldBuf != null && oldBuf.refCnt() > 0) {
-                oldBuf.release()
-            }
-        }
         // Acquire a new buffer with each cycle, in case the previous one isn't fully written out yet
         val buffer = allocator.buffer(BUF_CAPACITY, BUF_CAPACITY)
         details.buffer = buffer
-        details.builtIntoPacket = false
+        recycler += buffer
         return buffer
     }
 
@@ -845,6 +990,7 @@ public class PlayerInfo internal constructor(
         rootDetails.highResolutionIndices.fill(0)
         rootDetails.highResolutionCount = 0
         rootDetails.highResolutionPlayers.fill(0L)
+        rootDetails.highResolutionExtendedInfoTrackedPlayers.fill(0L)
         rootDetails.extendedInfoCount = 0
         rootDetails.extendedInfoIndices.fill(0)
         rootDetails.stationary.fill(0)
@@ -861,23 +1007,9 @@ public class PlayerInfo internal constructor(
     }
 
     private fun reset() {
-        // If player info was constructed, but it was not built into a packet object
-        // it implies the packet is never being written to Netty, which means
-        // a memory leak is occurring - if that is the case, release the buffer here
-        for (details in this.details) {
-            if (details == null) {
-                continue
-            }
-            if (!details.builtIntoPacket) {
-                val buffer = details.buffer
-                if (buffer != null && buffer.refCnt() > 0) {
-                    buffer.release(buffer.refCnt())
-                }
-            }
-            details.buffer = null
-        }
         for (i in 0..PROTOCOL_CAPACITY) {
             val details = this.details[i] ?: continue
+            details.buffer = null
             protocol.detailsStorage.push(details)
             this.details[i] = null
         }

@@ -2,7 +2,10 @@ package net.rsprot.protocol.game.outgoing.info.worldentityinfo
 
 import com.github.michaelbull.logging.InlineLogger
 import io.netty.buffer.ByteBufAllocator
+import net.rsprot.protocol.common.checkCommunicationThread
 import net.rsprot.protocol.common.client.OldSchoolClientType
+import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.worker.DefaultProtocolWorker
 import net.rsprot.protocol.game.outgoing.info.worker.ProtocolWorker
 import java.util.concurrent.Callable
@@ -10,24 +13,25 @@ import java.util.concurrent.Callable
 /**
  * The world entity protocol class will track everything related to world entities.
  * @property allocator the byte buffer allocator used for world entity buffers.
- * @property indexSupplier the index supplier implementation that yields indices of
- * the world entities which are near a specific coordinate.
  * @property exceptionHandler the exception handler which will be notified whenever
  * there is an exception caught in world entity avatar pre-computation.
  * @param factory the avatar factory used to provide instances of world entity avatars.
  * @property worker the protocol worker that will be executing the computation
  * of avatar and info buffers on the thread(s) specified by the implementation.
+ * @property zoneIndexStorage the index storage responsible for tracking world entity
+ * indexes across zones.
  * @property avatarRepository the repository containing all the world entity avatars.
  * @property worldEntityInfoRepository the repository containing all the currently
- * in used world entity info instances.
+ * in-use world entity info instances.
  */
 public class WorldEntityProtocol(
     private val allocator: ByteBufAllocator,
-    private val indexSupplier: WorldEntityIndexSupplier,
     private val exceptionHandler: WorldEntityAvatarExceptionHandler,
     factory: WorldEntityAvatarFactory,
     private val worker: ProtocolWorker = DefaultProtocolWorker(),
+    private val zoneIndexStorage: ZoneIndexStorage,
 ) {
+    private val recycler: ByteBufRecycler = ByteBufRecycler()
     private val avatarRepository = factory.avatarRepository
     private val worldEntityInfoRepository: WorldEntityInfoRepository =
         WorldEntityInfoRepository { localIndex, clientType ->
@@ -36,7 +40,8 @@ public class WorldEntityProtocol(
                 allocator,
                 clientType,
                 factory.avatarRepository,
-                indexSupplier,
+                zoneIndexStorage,
+                recycler,
             )
         }
 
@@ -56,13 +61,17 @@ public class WorldEntityProtocol(
     public fun alloc(
         idx: Int,
         oldSchoolClientType: OldSchoolClientType,
-    ): WorldEntityInfo = worldEntityInfoRepository.alloc(idx, oldSchoolClientType)
+    ): WorldEntityInfo {
+        checkCommunicationThread()
+        return worldEntityInfoRepository.alloc(idx, oldSchoolClientType)
+    }
 
     /**
      * Deallocates the world entity info, allowing for it to be re-used in the future.
      * @param info the world entity info to be deallocated.
      */
     public fun dealloc(info: WorldEntityInfo) {
+        checkCommunicationThread()
         // Prevent returning a destroyed worldentity info object back into the pool
         if (info.isDestroyed()) {
             return
@@ -74,9 +83,11 @@ public class WorldEntityProtocol(
      * Updates all the world entities that exist in one go.
      */
     public fun update() {
+        checkCommunicationThread()
         prepareHighResolutionBuffers()
         updateInfos()
         postUpdate()
+        recycler.cycle()
         cycleCount++
     }
 

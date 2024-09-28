@@ -68,24 +68,24 @@ public class PlayerAvatarExtendedInfo(
         buildClientWriterArray(extendedInfoWriters)
 
     /**
-     * An int array to keep track of the number of times we've seen someone modify their appearance.
-     * During low to high resolution transition, if our counter of their changes does not align
-     * with their own counter of their appearance changes, their appearance will be re-transmitted
-     * to our client, in order to synchronize it. If the values align, the client will utilize its
-     * previously cached variant.
+     * An int array to track the last cycle during which we recorded other players' appearances.
+     * If the values align, the client will utilize its previously cached variant.
      */
-    private val otherAppearanceChangesCounter: IntArray = IntArray(PlayerInfoProtocol.PROTOCOL_CAPACITY)
+    private val otherAppearanceChangeCycles: IntArray =
+        IntArray(PlayerInfoProtocol.PROTOCOL_CAPACITY) {
+            -1
+        }
 
     /**
-     * The number of times our appearance has changed.
+     * The last player info cycle on which our appearance changed.
      */
-    private var appearanceChangesCounter: Int = 0
+    private var lastAppearanceChangeCycle: Int = 0
 
     /**
      * Invalidates the appearance cache.
      */
     internal fun invalidateAppearanceCache() {
-        otherAppearanceChangesCounter.fill(0)
+        otherAppearanceChangeCycles.fill(-1)
     }
 
     /**
@@ -746,11 +746,6 @@ public class PlayerAvatarExtendedInfo(
      * @param name the name to assign.
      */
     public fun setName(name: String) {
-        verify {
-            require(name.length in 1..12) {
-                "Unexpected name length, expected range 1..12"
-            }
-        }
         if (blocks.appearance.name == name) {
             return
         }
@@ -1242,7 +1237,7 @@ public class PlayerAvatarExtendedInfo(
      */
     private fun flagAppearance() {
         flags = flags or APPEARANCE
-        appearanceChangesCounter++
+        lastAppearanceChangeCycle = PlayerInfoProtocol.cycleCount
     }
 
     /**
@@ -1260,8 +1255,8 @@ public class PlayerAvatarExtendedInfo(
      */
     internal fun reset() {
         flags = 0
-        this.appearanceChangesCounter = 0
-        this.otherAppearanceChangesCounter.fill(0)
+        this.lastAppearanceChangeCycle = 0
+        this.otherAppearanceChangeCycles.fill(-1)
         blocks.appearance.clear()
         blocks.moveSpeed.clear()
         blocks.temporaryMoveSpeed.clear()
@@ -1282,25 +1277,32 @@ public class PlayerAvatarExtendedInfo(
      * @param observer the avatar observing us.
      * @return the flags that need updating.
      */
-    internal fun getLowToHighResChangeExtendedInfoFlags(observer: PlayerAvatarExtendedInfo): Int {
+    internal fun getLowToHighResChangeExtendedInfoFlags(
+        observer: PlayerAvatarExtendedInfo,
+        oldSchoolClientType: OldSchoolClientType,
+    ): Int {
         var flag = 0
         if (this.flags and APPEARANCE == 0 &&
-            checkOutOfDate(observer)
+            checkOutOfDate(observer) &&
+            blocks.appearance.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or APPEARANCE
         }
         if (this.flags and MOVE_SPEED == 0 &&
-            blocks.moveSpeed.value != MoveSpeed.DEFAULT_MOVESPEED
+            blocks.moveSpeed.value != MoveSpeed.DEFAULT_MOVESPEED &&
+            blocks.moveSpeed.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or MOVE_SPEED
         }
         if (this.flags and FACE_PATHINGENTITY == 0 &&
-            blocks.facePathingEntity.index != FacePathingEntity.DEFAULT_VALUE
+            blocks.facePathingEntity.index != FacePathingEntity.DEFAULT_VALUE &&
+            blocks.facePathingEntity.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or FACE_PATHINGENTITY
         }
         if (this.flags and FACE_ANGLE == 0 &&
-            blocks.faceAngle.angle != FaceAngle.DEFAULT_VALUE
+            blocks.faceAngle.angle != FaceAngle.DEFAULT_VALUE &&
+            blocks.faceAngle.isPrecomputed(oldSchoolClientType)
         ) {
             flag = flag or FACE_ANGLE
         }
@@ -1314,7 +1316,7 @@ public class PlayerAvatarExtendedInfo(
      * variant is still up-to-date.
      */
     private fun checkOutOfDate(observer: PlayerAvatarExtendedInfo): Boolean =
-        observer.otherAppearanceChangesCounter[localIndex] != appearanceChangesCounter
+        observer.otherAppearanceChangeCycles[localIndex] < lastAppearanceChangeCycle
 
     /**
      * Silently synchronizes the angle of the avatar, meaning any new observers will see them
@@ -1382,17 +1384,17 @@ public class PlayerAvatarExtendedInfo(
         observerFlag: Int,
         observer: PlayerAvatarExtendedInfo,
         remainingAvatars: Int,
-    ) {
+    ): Boolean {
         val flag = this.flags or observerFlag
         if (!filter.accept(
                 buffer.writableBytes(),
                 flag,
                 remainingAvatars,
-                observer.otherAppearanceChangesCounter[localIndex] != 0,
+                observer.otherAppearanceChangeCycles[localIndex] != -1,
             )
         ) {
             buffer.p1(0)
-            return
+            return false
         }
         val writer =
             requireNotNull(writers[oldSchoolClientType.id]) {
@@ -1401,7 +1403,7 @@ public class PlayerAvatarExtendedInfo(
 
         // If appearance is flagged, ensure we synchronize the changes counter
         if (flag and APPEARANCE != 0) {
-            observer.otherAppearanceChangesCounter[localIndex] = appearanceChangesCounter
+            observer.otherAppearanceChangeCycles[localIndex] = lastAppearanceChangeCycle
         }
         writer.pExtendedInfo(
             buffer,
@@ -1410,6 +1412,7 @@ public class PlayerAvatarExtendedInfo(
             flag,
             blocks,
         )
+        return true
     }
 
     /**
@@ -1447,7 +1450,7 @@ public class PlayerAvatarExtendedInfo(
      * so it will be updated whenever someone else takes their index.
      */
     public fun onOtherAvatarDeallocated(idx: Int) {
-        otherAppearanceChangesCounter[idx] = -1
+        otherAppearanceChangeCycles[idx] = -1
     }
 
     public companion object {
