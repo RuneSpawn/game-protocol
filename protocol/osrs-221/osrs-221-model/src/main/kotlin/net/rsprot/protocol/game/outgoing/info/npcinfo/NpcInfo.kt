@@ -1,3 +1,5 @@
+@file:Suppress("DuplicatedCode")
+
 package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import io.netty.buffer.ByteBuf
@@ -5,16 +7,16 @@ import io.netty.buffer.ByteBufAllocator
 import net.rsprot.buffer.bitbuffer.BitBuf
 import net.rsprot.buffer.bitbuffer.toBitBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
-import net.rsprot.protocol.common.client.ClientTypeMap
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.ObserverExtendedInfoFlags
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
+import net.rsprot.protocol.internal.client.ClientTypeMap
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.message.OutgoingGameMessage
 import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.contract
@@ -34,6 +36,7 @@ import kotlin.contracts.contract
  * @property lowResolutionToHighResolutionEncoders a client map of low resolution to high resolution
  * change encoders, used to move a npc into high resolution for the given player.
  * As this is scrambled, a separate client-specific implementation is required.
+ * @property filter a npc avatar filter that must be passed to add/keep a npc in high resolution.
  */
 @Suppress("ReplaceUntilWithRangeUntil")
 @OptIn(ExperimentalUnsignedTypes::class)
@@ -45,6 +48,7 @@ public class NpcInfo internal constructor(
     private val zoneIndexStorage: ZoneIndexStorage,
     private val lowResolutionToHighResolutionEncoders: ClientTypeMap<NpcResolutionChangeEncoder>,
     private val recycler: ByteBufRecycler,
+    private val filter: NpcAvatarFilter?,
 ) : ReferencePooledObject {
     /**
      * The last cycle's coordinate of the local player, used to perform faster npc removal.
@@ -133,7 +137,7 @@ public class NpcInfo internal constructor(
 
     /**
      * The exception that was caught during the processing of this player's npc info packet.
-     * This exception will be propagated further during the [toNpcInfoPacket] function call,
+     * This exception will be propagated further during the [toPacket] function call,
      * allowing the server to handle it properly at a per-player basis.
      */
     @Volatile
@@ -147,13 +151,14 @@ public class NpcInfo internal constructor(
      * initialized for this cycle.
      */
     @Throws(IllegalStateException::class)
-    public fun backingBuffer(): ByteBuf = checkNotNull(buffer)
+    private fun backingBuffer(): ByteBuf = checkNotNull(buffer)
 
     /**
      * Sets the view distance, meaning how far the player can see NPCs.
      * @param num the distance from which NPCs become visible
      */
     public fun setViewDistance(num: Int) {
+        if (isDestroyed()) return
         this.viewDistance = num
     }
 
@@ -161,6 +166,7 @@ public class NpcInfo internal constructor(
      * Resets the view distance back to a default value of 15 tile radius.
      */
     public fun resetViewDistance() {
+        if (isDestroyed()) return
         this.viewDistance = MAX_SMALL_PACKET_DISTANCE
     }
 
@@ -170,6 +176,7 @@ public class NpcInfo internal constructor(
      * @return the newly created arraylist of indices
      */
     public fun getHighResolutionIndices(): ArrayList<Int> {
+        if (isDestroyed()) return ArrayList(0)
         val collection = ArrayList<Int>(highResolutionNpcIndexCount)
         for (i in 0..<highResolutionNpcIndexCount) {
             val index = highResolutionNpcIndices[i].toInt()
@@ -186,6 +193,7 @@ public class NpcInfo internal constructor(
      * @return the provided [collection] to chaining.
      */
     public fun <T> appendHighResolutionIndices(collection: T): T where T : MutableCollection<Int> {
+        if (isDestroyed()) return collection
         for (i in 0..<highResolutionNpcIndexCount) {
             val index = highResolutionNpcIndices[i].toInt()
             collection.add(index)
@@ -197,7 +205,17 @@ public class NpcInfo internal constructor(
      * Turns this npc info structure into a respective npc info packet, depending
      * on the current known view distance.
      */
-    public fun toNpcInfoPacket(): OutgoingGameMessage {
+    @Deprecated(
+        message = "Deprecated. Prefer toPacket() function instead for consistency.",
+        replaceWith = ReplaceWith("toPacket()"),
+    )
+    public fun toNpcInfoPacket(): OutgoingGameMessage = toPacket()
+
+    /**
+     * Turns this npc info structure into a respective npc info packet, depending
+     * on the current known view distance.
+     */
+    public fun toPacket(): OutgoingGameMessage {
         val exception = this.exception
         if (exception != null) {
             throw InfoProcessException(
@@ -219,6 +237,7 @@ public class NpcInfo internal constructor(
      * @param buildArea the build area to assign.
      */
     public fun updateBuildArea(buildArea: BuildArea) {
+        if (isDestroyed()) return
         this.buildArea = buildArea
     }
 
@@ -238,6 +257,7 @@ public class NpcInfo internal constructor(
         widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
         heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
     ) {
+        if (isDestroyed()) return
         this.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
@@ -267,6 +287,7 @@ public class NpcInfo internal constructor(
         x: Int,
         z: Int,
     ) {
+        if (isDestroyed()) return
         this.localPlayerCurrentCoord =
             CoordGrid(
                 level,
@@ -280,7 +301,7 @@ public class NpcInfo internal constructor(
      * additionally marks down which NPCs need to furthermore send their extended info
      * updates.
      */
-    public fun compute() {
+    internal fun compute() {
         val viewDistance = this.viewDistance
         val buffer = allocBuffer()
         buffer.toBitBuf().use { bitBuffer ->
@@ -305,7 +326,7 @@ public class NpcInfo internal constructor(
      * in high resolution more efficient, as we can avoid distance checks against every
      * NPC, and only do so against the player's last coordinate.
      */
-    public fun afterUpdate() {
+    internal fun afterUpdate() {
         this.localPlayerLastCoord = localPlayerCurrentCoord
         extendedInfoCount = 0
         observerExtendedInfoFlags.reset()
@@ -319,8 +340,18 @@ public class NpcInfo internal constructor(
         val jagBuffer = backingBuffer().toJagByteBuf()
         for (i in 0 until extendedInfoCount) {
             val index = extendedInfoIndices[i].toInt()
-            val other = checkNotNull(repository.getOrNull(index))
-            val observerFlag = observerExtendedInfoFlags.getFlag(i) and 0xFF
+            val other = repository.getOrNull(index)
+            if (other == null) {
+                // If other is null at this point, it means it was destroyed mid-processing at an earlier
+                // stage. In order to avoid the issue escalating further by throwing errors for every player
+                // that was in vicinity of the NPC that got destroyed, we simply write no-mask-update,
+                // even though a mask update was requested at an earlier stage.
+                // The next game tick, the NPC will be removed as the info is null, which is one of
+                // the conditions for removing a NPC from tracking.
+                jagBuffer.p1(0)
+                continue
+            }
+            val observerFlag = observerExtendedInfoFlags.getFlag(i)
             other.extendedInfo.pExtendedInfo(
                 oldSchoolClientType,
                 jagBuffer,
@@ -409,7 +440,7 @@ public class NpcInfo internal constructor(
             for (i in 0..<highResolutionNpcIndexCount) {
                 val npcIndex = highResolutionNpcIndices[i].toInt()
                 val avatar = repository.getOrNull(npcIndex) ?: continue
-                avatar.removeObserver()
+                avatar.removeObserver(localPlayerIndex)
             }
             highResolutionNpcIndexCount = 0
             return false
@@ -423,7 +454,7 @@ public class NpcInfo internal constructor(
             if (!removeHighResolutionNpc(avatar, viewDistance)) {
                 break
             }
-            avatar?.removeObserver()
+            avatar?.removeObserver(localPlayerIndex)
             highResolutionNpcIndexCount--
         }
         val processedCount = this.highResolutionNpcIndexCount
@@ -434,7 +465,7 @@ public class NpcInfo internal constructor(
             if (removeHighResolutionNpc(avatar, viewDistance)) {
                 buffer.pBits(1, 1)
                 buffer.pBits(2, 3)
-                avatar?.removeObserver()
+                avatar?.removeObserver(localPlayerIndex)
                 highResolutionNpcIndices[i] = NPC_INDEX_TERMINATOR
                 highResolutionNpcIndexCount--
                 continue
@@ -477,7 +508,13 @@ public class NpcInfo internal constructor(
         if (!withinDistance(localPlayerCurrentCoord, coord, viewDistance)) {
             return true
         }
-        return coord !in buildArea
+        val buildArea = this.buildArea
+        if (buildArea != BuildArea.INVALID && coord !in buildArea) {
+            return true
+        }
+        val filter = this.filter
+        return filter != null &&
+            !filter.accept(localPlayerIndex, avatar.details.index)
     }
 
     /**
@@ -485,7 +522,10 @@ public class NpcInfo internal constructor(
      * before adding it to our high resolution view.
      * @param avatar the npc avatar to check
      */
-    private fun isInBuildArea(avatar: NpcAvatar): Boolean = avatar.details.currentCoord in buildArea
+    private fun isInBuildArea(avatar: NpcAvatar): Boolean {
+        val buildArea = this.buildArea
+        return buildArea == BuildArea.INVALID || avatar.details.currentCoord in buildArea
+    }
 
     /**
      * Checks if the player has moved a greater distance from their previous coordinate
@@ -531,7 +571,8 @@ public class NpcInfo internal constructor(
         val startZ = ((centerZ - viewDistance) shr 3).coerceAtLeast(0)
         val endX = ((centerX + viewDistance) shr 3).coerceAtMost(0x7FF)
         val endZ = ((centerZ + viewDistance) shr 3).coerceAtMost(0x7FF)
-        for (x in startX..endX) {
+        val filter = this.filter
+        loop@for (x in startX..endX) {
             for (z in startZ..endZ) {
                 val npcs = this.zoneIndexStorage.get(level, x, z) ?: continue
                 for (k in 0..<npcs.size) {
@@ -543,7 +584,7 @@ public class NpcInfo internal constructor(
                         continue
                     }
                     if (highResolutionNpcIndexCount >= MAX_HIGH_RESOLUTION_NPCS) {
-                        break
+                        break@loop
                     }
                     val avatar = repository.getOrNull(index) ?: continue
                     if (avatar.details.inaccessible) {
@@ -559,7 +600,10 @@ public class NpcInfo internal constructor(
                     if (!isInBuildArea(avatar)) {
                         continue
                     }
-                    avatar.addObserver()
+                    if (filter != null && !filter.accept(localPlayerIndex, index)) {
+                        continue
+                    }
+                    avatar.addObserver(localPlayerIndex)
                     val i = highResolutionNpcIndexCount++
                     highResolutionNpcIndices[i] = index.toUShort()
                     val observerFlags = avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags()
@@ -621,6 +665,7 @@ public class NpcInfo internal constructor(
      * whenever a reconnect occurs.
      */
     public fun onReconnect() {
+        if (isDestroyed()) return
         onDealloc()
         this.highResolutionNpcIndexCount = 0
         this.extendedInfoCount = 0
@@ -646,7 +691,7 @@ public class NpcInfo internal constructor(
         for (i in 0..<highResolutionNpcIndexCount) {
             val npcIndex = highResolutionNpcIndices[i].toInt()
             val avatar = repository.getOrNull(npcIndex) ?: continue
-            avatar.removeObserver()
+            avatar.removeObserver(localPlayerIndex)
         }
     }
 

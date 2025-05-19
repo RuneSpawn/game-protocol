@@ -1,12 +1,11 @@
 package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import net.rsprot.buffer.bitbuffer.UnsafeLongBackedBitBuf
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.npcinfo.NpcAvatarDetails
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.npcinfo.util.NpcCellOpcodes
 import net.rsprot.protocol.game.outgoing.info.util.Avatar
-import java.util.concurrent.atomic.AtomicInteger
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.npcinfo.NpcAvatarDetails
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 
 /**
  * The npc avatar class represents an NPC as shown by the client.
@@ -50,7 +49,7 @@ public class NpcAvatar internal constructor(
     direction: Int = 0,
     allocateCycle: Int,
     public val extendedInfo: NpcAvatarExtendedInfo,
-    public val zoneIndexStorage: ZoneIndexStorage,
+    internal val zoneIndexStorage: ZoneIndexStorage,
 ) : Avatar {
     /**
      * Npc avatar details class wraps all the client properties of a NPC in its own
@@ -68,20 +67,7 @@ public class NpcAvatar internal constructor(
             allocateCycle,
         )
 
-    /**
-     * The number of player avatars observing this NPC avatar.
-     * We utilize the count tracking to determine what NPCs require precomputation.
-     * As the game has circa 25,000 NPCs, and even at max world capacity, only 2,000 players,
-     * the majority of NPCs in the game will at all times __not__ be observed by any players.
-     * This means computing their high resolution blocks is unnecessary, as that is strictly
-     * only for players who are already observing a NPC - moving from low resolution to high
-     * resolution has its own set of code.
-     * Additionally, this is used to skip computing extended info blocks later on in the cycle,
-     * given the assumption that no player added this NPC to their high resolution view.
-     * Furthermore, this observer count must be an atomic integer, as certain parts of NPC info
-     * are multithreaded, including the parts which modify this count.
-     */
-    private val observerCount: AtomicInteger = AtomicInteger()
+    private val tracker: NpcAvatarTracker = NpcAvatarTracker()
 
     /**
      * The high resolution movement buffer, used to avoid re-calculating the movement information
@@ -96,15 +82,15 @@ public class NpcAvatar internal constructor(
      * Note that it is necessary for servers to de-register npc info when the player is logging off,
      * or the protocol will run into issues on multiple levels.
      */
-    internal fun addObserver() {
-        observerCount.incrementAndGet()
+    internal fun addObserver(index: Int) {
+        tracker.add(index)
     }
 
     /**
      * Removes an observer from this avatar by decrementing the observer count.
      * This function must be called when a player logs off for each NPC they were observing.
      */
-    internal fun removeObserver() {
+    internal fun removeObserver(index: Int) {
         // If the allocation cycle is the same as current cycle count,
         // a "hotswap" has occurred.
         // This means that a npc was deallocated and another allocated the same index
@@ -114,20 +100,14 @@ public class NpcAvatar internal constructor(
         if (details.allocateCycle == NpcInfoProtocol.cycleCount) {
             return
         }
-        observerCount.decrementAndGet()
+        tracker.remove(index)
     }
-
-    /**
-     * Checks if this NPC has any observers, necessary to determine whether cached information
-     * must be computed for this NPC.
-     */
-    internal fun hasObservers(): Boolean = observerCount.get() > 0
 
     /**
      * Resets the observer count.
      */
     internal fun resetObservers() {
-        observerCount.set(0)
+        tracker.reset()
     }
 
     /**
@@ -149,7 +129,34 @@ public class NpcAvatar internal constructor(
      *
      * @param direction the direction for the NPC to face.
      */
+    @Deprecated(
+        message = "Deprecated. Use setDirection(direction) for consistency.",
+        replaceWith = ReplaceWith("setDirection(direction)"),
+    )
     public fun updateDirection(direction: Int) {
+        setDirection(direction)
+    }
+
+    /**
+     * Updates the spawn direction of the NPC.
+     *
+     * Table of possible direction values:
+     * ```
+     * | Id |  Direction | Angle |
+     * |:--:|:----------:|:-----:|
+     * |  0 | North-West |  768  |
+     * |  1 |    North   |  1024 |
+     * |  2 | North-East |  1280 |
+     * |  3 |    West    |  512  |
+     * |  4 |    East    |  1536 |
+     * |  5 | South-West |  256  |
+     * |  6 |    South   |   0   |
+     * |  7 | South-East |  1792 |
+     * ```
+     *
+     * @param direction the direction for the NPC to face.
+     */
+    public fun setDirection(direction: Int) {
         require(direction in 0..7) {
             "Direction must be a value in range of 0..7. " +
                 "See the table in documentation. Value: $direction"
@@ -191,7 +198,8 @@ public class NpcAvatar internal constructor(
         jump: Boolean,
     ) {
         zoneIndexStorage.remove(details.index, details.currentCoord)
-        details.currentCoord = CoordGrid(level, x, z)
+        details.currentCoord =
+            CoordGrid(level, x, z)
         zoneIndexStorage.add(details.index, details.currentCoord)
         details.movementType = details.movementType or (if (jump) NpcAvatarDetails.TELEJUMP else NpcAvatarDetails.TELE)
     }
@@ -259,7 +267,8 @@ public class NpcAvatar internal constructor(
         val opcode = NpcCellOpcodes.singleCellMovementOpcode(deltaX, deltaZ)
         val (level, x, z) = details.currentCoord
         zoneIndexStorage.remove(details.index, details.currentCoord)
-        details.currentCoord = CoordGrid(level, x + deltaX, z + deltaZ)
+        details.currentCoord =
+            CoordGrid(level, x + deltaX, z + deltaZ)
         zoneIndexStorage.add(details.index, details.currentCoord)
         when (++details.stepCount) {
             1 -> {
@@ -288,7 +297,7 @@ public class NpcAvatar internal constructor(
     internal fun prepareBitcodes() {
         val movementType = details.movementType
         // If teleporting, or if there are no observers, there's no need to compute this
-        if (movementType and (NpcAvatarDetails.TELE or NpcAvatarDetails.TELEJUMP) != 0 || observerCount.get() == 0) {
+        if (movementType and (NpcAvatarDetails.TELE or NpcAvatarDetails.TELEJUMP) != 0 || !tracker.hasObservers()) {
             return
         }
         val buffer = UnsafeLongBackedBitBuf()
@@ -403,13 +412,25 @@ public class NpcAvatar internal constructor(
      * @return true if the NPC has at least one player currently observing it via
      * NPC info, false otherwise.
      */
-    public fun isActive(): Boolean = observerCount.get() > 0
+    public fun isActive(): Boolean = tracker.hasObservers()
 
     /**
      * Checks the number of players that are currently observing this NPC avatar.
      * @return the number of players that are observing this avatar.
      */
-    public fun getObserverCount(): Int = observerCount.get()
+    public fun getObserverCount(): Int = tracker.getObserverCount()
+
+    /**
+     * Gets a set of all the indexes of the players that are observing this NPC.
+     *
+     * It is important to note that the collection is re-used across cycles.
+     * If the collection is intended to be stored for long-term usage, it should be
+     * copied to a new data set, or re-called each cycle. Trying to access the iterator
+     * across game cycles will result in a [ConcurrentModificationException].
+     *
+     * @return a set of all the player indices observing this NPC.
+     */
+    public fun getObservingPlayerIndices(): Set<Int> = tracker.getCachedSet()
 
     override fun postUpdate() {
         details.stepCount = 0
@@ -423,7 +444,7 @@ public class NpcAvatar internal constructor(
         "NpcAvatar(" +
             "extendedInfo=$extendedInfo, " +
             "details=$details, " +
-            "observerCount=$observerCount, " +
+            "tracker=$tracker, " +
             "highResMovementBuffer=$highResMovementBuffer" +
             ")"
 }

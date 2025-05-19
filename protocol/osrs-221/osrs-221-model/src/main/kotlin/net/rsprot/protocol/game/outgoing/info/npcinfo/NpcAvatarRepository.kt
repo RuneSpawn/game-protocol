@@ -2,10 +2,10 @@ package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import io.netty.buffer.ByteBufAllocator
 import net.rsprot.compression.provider.HuffmanCodecProvider
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.npcinfo.NpcAvatarDetails
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.filter.ExtendedInfoFilter
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.npcinfo.NpcAvatarDetails
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.SoftReference
 
@@ -91,6 +91,9 @@ internal class NpcAvatarRepository(
         spawnCycle: Int = 0,
         direction: Int = 0,
     ): NpcAvatar {
+        require(this.elements[index] == null) {
+            "NPC Avatar with index $index is already allocated!"
+        }
         val existing = queue.poll()?.get()
         if (existing != null) {
             existing.resetObservers()
@@ -98,7 +101,8 @@ internal class NpcAvatarRepository(
             resetTransientDetails(details)
             details.index = index
             details.id = id
-            details.currentCoord = CoordGrid(level, x, z)
+            details.currentCoord =
+                CoordGrid(level, x, z)
             details.spawnCycle = spawnCycle
             details.direction = direction
             details.allocateCycle = NpcInfoProtocol.cycleCount
@@ -137,8 +141,13 @@ internal class NpcAvatarRepository(
      * @param avatar the avatar to release.
      */
     fun release(avatar: NpcAvatar) {
-        zoneIndexStorage.remove(avatar.details.index, avatar.details.currentCoord)
-        this.elements[avatar.details.index] = null
+        val index = avatar.details.index
+        // Ensure the avatars share the same reference!
+        require(this.elements[index] === avatar) {
+            "Attempting to release an invalid NPC avatar: $avatar, ${this.elements[index]}"
+        }
+        zoneIndexStorage.remove(index, avatar.details.currentCoord)
+        this.elements[index] = null
         avatar.extendedInfo.reset()
         val reference = SoftReference(avatar, queue)
         reference.enqueue()

@@ -7,7 +7,7 @@ import net.rsprot.protocol.api.logging.js5Log
 import net.rsprot.protocol.js5.incoming.Js5GroupRequest
 import net.rsprot.protocol.js5.outgoing.Js5GroupResponse
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 
@@ -63,6 +63,7 @@ public class Js5Service(
                             }
                         try {
                             response = client.getNextBlock(
+                                configuration.missingGroupBehaviour,
                                 provider,
                                 configuration.blockSizeInBytes * ratio,
                             ) ?: continue
@@ -261,7 +262,7 @@ public class Js5Service(
         /**
          * The interval at which a terminator byte is expected in the client.
          */
-        private const val BLOCK_LENGTH: Int = 512
+        internal const val BLOCK_LENGTH: Int = 512
         private val logger: InlineLogger = InlineLogger()
 
         /**
@@ -297,12 +298,36 @@ public class Js5Service(
             }
         }
 
-        public fun startPrefetching(service: Js5Service): ScheduledFuture<*> =
-            Executors.newSingleThreadScheduledExecutor().scheduleWithFixedDelay(
+        /**
+         * Ensures that the input buffer has been correctly sliced up.
+         * We run this validation on the first JS5 response we receive that is at least [BLOCK_LENGTH]
+         * in size. While it is possible that the buffer isn't correctly sliced up, but just happens
+         * to have 0xFF at the right positions, it's very unlikely.
+         * This simply offers a little extra warning for people trying to implement the JS5 system,
+         * giving a clear indication that they've not called the necessary functions in order to
+         * prepare the JS5 buffers ahead of time.
+         * @param buffer the byte buffer to check for valid terminators.
+         * @return whether the byte buffer has been correctly sliced up.
+         */
+        internal fun ensureCorrectlySliced(buffer: ByteBuf): Boolean {
+            val cap = buffer.readableBytes()
+            for (i in BLOCK_LENGTH..<cap step BLOCK_LENGTH) {
+                if (buffer.getByte(i).toInt() and 0xFF != 0xFF) {
+                    return false
+                }
+            }
+            return true
+        }
+
+        public fun startPrefetching(service: Js5Service): ScheduledExecutorService {
+            val executor = Executors.newSingleThreadScheduledExecutor()
+            executor.scheduleWithFixedDelay(
                 service.prefetch(),
                 200,
                 200,
                 TimeUnit.MILLISECONDS,
             )
+            return executor
+        }
     }
 }

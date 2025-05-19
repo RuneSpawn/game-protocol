@@ -2,13 +2,13 @@ package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import com.github.michaelbull.logging.InlineLogger
 import io.netty.buffer.ByteBufAllocator
-import net.rsprot.protocol.common.client.ClientTypeMap
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.worker.DefaultProtocolWorker
 import net.rsprot.protocol.game.outgoing.info.worker.ProtocolWorker
+import net.rsprot.protocol.internal.client.ClientTypeMap
+import net.rsprot.protocol.internal.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 import java.util.concurrent.Callable
 
 /**
@@ -32,6 +32,7 @@ public class NpcInfoProtocol(
     private val exceptionHandler: NpcAvatarExceptionHandler,
     private val worker: ProtocolWorker = DefaultProtocolWorker(),
     private val zoneIndexStorage: ZoneIndexStorage,
+    private val filter: NpcAvatarFilter? = null,
 ) {
     /**
      * The avatar repository keeps track of all the avatars currently in the game.
@@ -53,6 +54,7 @@ public class NpcInfoProtocol(
                 zoneIndexStorage,
                 resolutionChangeEncoders,
                 recycler,
+                filter,
             )
         }
 
@@ -117,7 +119,7 @@ public class NpcInfoProtocol(
     private fun prepareBitcodes() {
         for (i in 0..<NpcAvatarRepository.AVATAR_CAPACITY) {
             val avatar = avatarRepository.getOrNull(i) ?: continue
-            if (!avatar.hasObservers()) continue
+            if (!avatar.isActive()) continue
             try {
                 avatar.prepareBitcodes()
             } catch (e: Exception) {
@@ -140,13 +142,16 @@ public class NpcInfoProtocol(
         for (i in 0..<NpcAvatarRepository.AVATAR_CAPACITY) {
             val avatar = avatarRepository.getOrNull(i) ?: continue
             try {
+                val extendedInfo = avatar.extendedInfo
+                // Skip the loop early if there are no flags
+                if (!extendedInfo.hasExtendedInfo()) continue
                 // If there are no observers, only pre-compute the extended info blocks
                 // which get cached and could be transmitted in the future via
                 // low -> high resolution changes
-                if (!avatar.hasObservers()) {
-                    avatar.extendedInfo.precomputeCached()
+                if (!avatar.isActive()) {
+                    extendedInfo.precomputeCached()
                 } else {
-                    avatar.extendedInfo.precompute()
+                    extendedInfo.precompute()
                 }
             } catch (e: Exception) {
                 exceptionHandler.exceptionCaught(i, e)
@@ -183,13 +188,21 @@ public class NpcInfoProtocol(
      * Cleans up any single-cycle temporary information for npc info protocol.
      */
     private fun postUpdate() {
-        for (i in 1..<PROTOCOL_CAPACITY) {
-            val info = npcInfoRepository.getOrNull(i) ?: continue
-            info.afterUpdate()
+        execute {
+            afterUpdate()
         }
-        for (i in 0..<65536) {
+        for (i in 0..<NpcAvatarRepository.AVATAR_CAPACITY) {
             val avatar = avatarRepository.getOrNull(i) ?: continue
-            avatar.postUpdate()
+            try {
+                avatar.postUpdate()
+            } catch (e: Exception) {
+                exceptionHandler.exceptionCaught(i, e)
+            } catch (t: Throwable) {
+                logger.error(t) {
+                    "Error during npc avatar post update"
+                }
+                throw t
+            }
         }
     }
 
@@ -224,7 +237,7 @@ public class NpcInfoProtocol(
 
     /**
      * Submits an exception to a specific player's npc info packet, which will be propagated further
-     * whenever the server tries to call the [NpcInfo.toNpcInfoPacket] function, allowing the server to properly
+     * whenever the server tries to call the [NpcInfo.toPacket] function, allowing the server to properly
      * handle exceptions for a given player despite it being calculated for the entire server in one go.
      * @param index the index of the player who caught an exception during their npc info processing
      * @param exception the exception caught during processing

@@ -1,8 +1,8 @@
 package net.rsprot.protocol.game.outgoing.info.worldentityinfo
 
 import io.netty.buffer.ByteBufAllocator
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.SoftReference
 
@@ -56,6 +56,9 @@ public class WorldEntityAvatarRepository internal constructor(
         level: Int,
         angle: Int,
     ): WorldEntityAvatar {
+        require(this.elements[index] == null) {
+            "WorldEntity avatar with index $index is already allocated!"
+        }
         val existing = queue.poll()?.get()
         if (existing != null) {
             existing.index = index
@@ -89,8 +92,13 @@ public class WorldEntityAvatarRepository internal constructor(
      * @param avatar the avatar to release.
      */
     public fun release(avatar: WorldEntityAvatar) {
-        zoneIndexStorage.remove(avatar.index, avatar.currentCoord)
-        this.elements[avatar.index] = null
+        val index = avatar.index
+        // Ensure the avatars share the same reference!
+        require(this.elements[index] === avatar) {
+            "Attempting to release an invalid WorldEntity avatar: $avatar, ${this.elements[index]}"
+        }
+        zoneIndexStorage.remove(index, avatar.currentCoord)
+        this.elements[index] = null
         val reference = SoftReference(avatar, queue)
         reference.enqueue()
     }

@@ -14,6 +14,7 @@ import net.rsprot.protocol.api.js5.Js5MessageDecoder
 import net.rsprot.protocol.api.js5.Js5MessageEncoder
 import net.rsprot.protocol.api.logging.networkLog
 import net.rsprot.protocol.api.metrics.addDisconnectionReason
+import net.rsprot.protocol.common.RSProtConstants
 import net.rsprot.protocol.loginprot.incoming.InitGameConnection
 import net.rsprot.protocol.loginprot.incoming.InitJs5RemoteConnection
 import net.rsprot.protocol.loginprot.outgoing.LoginResponse
@@ -45,6 +46,7 @@ public class LoginChannelHandler(
 
     override fun channelActive(ctx: ChannelHandlerContext) {
         ctx.read()
+        ctx.fireChannelActive()
         networkLog(logger) {
             "Channel is now active: ${ctx.channel()}"
         }
@@ -95,7 +97,7 @@ public class LoginChannelHandler(
                 "INetAddressValidator rejected game connection for channel ${ctx.channel()}"
             }
             ctx
-                .write(LoginResponse.TooManyAttempts)
+                .writeAndFlush(LoginResponse.TooManyAttempts)
                 .addListener(ChannelFutureListener.CLOSE)
             networkService
                 .trafficMonitor
@@ -115,7 +117,7 @@ public class LoginChannelHandler(
             "Game connection accepted with session id: ${NumberFormat.getNumberInstance().format(sessionId)}"
         }
         ctx
-            .write(LoginResponse.Successful(sessionId))
+            .writeAndFlush(LoginResponse.Successful(sessionId))
             .addListener(
                 ChannelFutureListener { future ->
                     if (!future.isSuccess) {
@@ -156,7 +158,7 @@ public class LoginChannelHandler(
         revision: Int,
         seed: IntArray,
     ) {
-        if (revision != NetworkService.REVISION) {
+        if (revision != RSProtConstants.REVISION) {
             networkLog(logger) {
                 "Invalid JS5 revision received from channel '${ctx.channel()}': $revision"
             }
@@ -168,7 +170,7 @@ public class LoginChannelHandler(
                     LoginDisconnectionReason.CHANNEL_OUT_OF_DATE,
                 )
             ctx
-                .write(LoginResponse.ClientOutOfDate)
+                .writeAndFlush(LoginResponse.ClientOutOfDate)
                 .addListener(ChannelFutureListener.CLOSE)
             return
         }
@@ -188,7 +190,7 @@ public class LoginChannelHandler(
                 "INetAddressValidator rejected JS5 connection for channel ${ctx.channel()}"
             }
             ctx
-                .write(LoginResponse.IPLimit)
+                .writeAndFlush(LoginResponse.IPLimit)
                 .addListener(ChannelFutureListener.CLOSE)
             networkService
                 .trafficMonitor
@@ -200,7 +202,7 @@ public class LoginChannelHandler(
             return
         }
         ctx
-            .write(LoginResponse.Successful(null))
+            .writeAndFlush(LoginResponse.Successful(null))
             .addListener(
                 ChannelFutureListener { future ->
                     if (!future.isSuccess) {
@@ -258,6 +260,10 @@ public class LoginChannelHandler(
                 ctx.inetAddress(),
                 LoginDisconnectionReason.CHANNEL_EXCEPTION,
             )
+        val channel = ctx.channel()
+        if (channel.isOpen) {
+            channel.close()
+        }
     }
 
     override fun userEventTriggered(
@@ -277,6 +283,7 @@ public class LoginChannelHandler(
                 )
             ctx.close()
         }
+        ctx.fireUserEventTriggered(evt)
     }
 
     private companion object {

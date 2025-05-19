@@ -1,6 +1,16 @@
 # RSProt
 
-[![GitHub Actions][actions-badge]][actions] [![MIT license][mit-badge]][mit] [![OldSchool - 225 (Alpha)](https://img.shields.io/badge/OldSchool-225_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-225/osrs-225-api/src/main/kotlin/net/rsprot/protocol/api) [![OldSchool - 224 (Alpha)](https://img.shields.io/badge/OldSchool-224_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-224/osrs-224-api/src/main/kotlin/net/rsprot/protocol/api) [![OldSchool - 223 (Alpha)](https://img.shields.io/badge/OldSchool-223_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-223/osrs-223-api/src/main/kotlin/net/rsprot/protocol/api) [![OldSchool - 222 (Alpha)](https://img.shields.io/badge/OldSchool-222_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-222/osrs-222-api/src/main/kotlin/net/rsprot/protocol/api) [![OldSchool - 221 (Alpha)](https://img.shields.io/badge/OldSchool-221_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-221-api/src/main/kotlin/net/rsprot/protocol/api)
+[![GitHub Actions][actions-badge]][actions] [![MIT license][mit-badge]][mit]
+[![OldSchool - 230 (Alpha)](https://img.shields.io/badge/OldSchool-230_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-230/osrs-230-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 229 (Alpha)](https://img.shields.io/badge/OldSchool-229_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-229/osrs-229-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 228 (Alpha)](https://img.shields.io/badge/OldSchool-228_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-228/osrs-228-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 227 (Alpha)](https://img.shields.io/badge/OldSchool-227_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-227/osrs-227-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 226 (Alpha)](https://img.shields.io/badge/OldSchool-226_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-226/osrs-226-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 225 (Alpha)](https://img.shields.io/badge/OldSchool-225_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-225/osrs-225-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 224 (Alpha)](https://img.shields.io/badge/OldSchool-224_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-224/osrs-224-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 223 (Alpha)](https://img.shields.io/badge/OldSchool-223_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-223/osrs-223-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 222 (Alpha)](https://img.shields.io/badge/OldSchool-222_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-222/osrs-222-api/src/main/kotlin/net/rsprot/protocol/api)
+[![OldSchool - 221 (Alpha)](https://img.shields.io/badge/OldSchool-221_(Alpha)-9a1abd)](https://github.com/blurite/rsprot/tree/master/protocol/osrs-221-api/src/main/kotlin/net/rsprot/protocol/api)
 
 ## Status
 > [!NOTE]
@@ -15,7 +25,7 @@ In order to add it to your server, add the below line under dependencies
 in your build.gradle.kts.
 
 ```kts
-implementation("net.rsprot:osrs-225-api:1.0.0-ALPHA-20240928")
+implementation("net.rsprot:osrs-230-api:1.0.0-ALPHA-20250518-2")
 ```
 
 An in-depth tutorial on how to implement it will be added into this read-me
@@ -31,12 +41,12 @@ other revisions are welcome, but will not be provided by default.
 - Java 11
 
 ## Supported Versions
-This library currently supports revision 221, 222, 223, 224 and 225 OldSchool desktop clients.
+This library currently supports revision 221-230 OldSchool desktop clients.
 
 ## Quick Guide
 This section covers a quick guide for how to use the protocol after implementing
 the base API. It is not a guide for the base API itself, that will come in the
-future. This specific quick guide refers to revision 225.
+future. This specific quick guide refers to revision 230.
 
 #### Player Initialization
 When a player logs in, a new protocol instance must be allocated for
@@ -233,6 +243,108 @@ protocol. This can be done via:
 `service.worldEntityAvatarFactory.release(avatar)`
 
 ## Changes
+
+### Revision 230
+Revision 230 was primarily a cleanup revision, with no new packets or changes
+introduced.
+
+#### Removals
+- CLEAR_ENTITIES
+- WORLDENTITY_INFO_V4
+
+### Revision 229
+Revision 229 brings the following changes:
+
+#### Additions
+1. SET_ACTIVE_WORLD_V2: A simplified variant of the V1 packet.
+2. An unknown var-short packet: Good chance this is the removed
+WORLDENTITY_INFO_V3 packet, but it's hard to say with certainty.
+It is unused on both Java and C++ clients, and only reads g1()
+which it discards.
+
+#### Removals
+1. LOC_ADD_CHANGE_V1: Removed as revision 228 introduced the V2 variant
+which has been in use since then.
+2. WORLDENTITY_INFO_V3: Removed since V4 has been in use starting with
+revision 227.
+
+#### Changes
+1. CAMERA_TARGET_V2 has now been migrated to V3, and structural changes
+have been done to the packet.
+2. Login CRCs now transmit 23 CRCs instead of the previous 21.
+REMAINING_BETA_ARCHIVES has gone from opcode 20 to 32, as the client
+still needs to support last revision's variant.
+
+### Revision 228
+Revision 228 comes with very little changes, only introducing a single
+new server packet. This revision does not delete any other packets, or
+change almost anything else in the client, even outside of networking.
+
+#### Additions
+1. LOC_ADD_CHANGE_V2: A new variant of LOC_ADD_CHANGE that has support for
+server-provided minimenu ops. An example of this would be "Cut-down" on trees,
+allowing the server to change that to something completely dynamic.
+OldSchool RuneScape is no longer using the older packet, even if no option
+overrides are used.
+
+### Revision 227
+Revision 227 was mostly a clean-up revision, doing little overall changes.
+
+#### Additions
+1. An unknown client packet which is not used on native desktop nor java.
+This packet might be used in mobile, we do not know. It has a size of 1 byte.
+2. PACKET_GROUP_START: A packet which lets the server tell the client to process
+a group of packets all in one client cycle after waiting for the packets to
+arrive completely. This packet has one flaw - it is limited to a maximum size of
+32767 bytes for the payload (sum of all the children, including their opcodes,
+sizes and payloads).
+3. WORLDENTITY_INFO_V4: A new variant of world entity info, adding support
+for defining the offset for the ship model/center-point in fine client units.
+
+#### Removals
+1. WORLDENTITY_INFO_V1 (server)
+2. WORLDENTITY_INFO_V2 (server)
+3. NPC_INFO_SMALL_V4 (server)
+4. NPC_INFO_LARGE_V5 (server)
+5. PROJANIM_SPECIFIC_V1 (server)
+6. PROJANIM_SPECIFIC_V2 (server)
+7. UPDATE_FRIENDCHAT_CHANNEL_FULL_V1 (server)
+8. UPDATE_STAT_V1 (server)
+9. CAM_TARGET_V1 (server)
+10. UPDATE_PLAYER_MODEL_V1 (client)
+11. EXAMINE_OBJ_V1 (client)
+
+
+### Revision 226
+Revision 226 was a relatively large protocol change, adding many new
+server prot variants, and one extra client prot. In this revision, we also migrated
+from the `_OLD` naming scheme to `_V*` versioning scheme, to better reflect
+on what Jagex uses.
+
+#### Additions
+
+##### Client Prots
+1. SET_HEADING: used to inform the server of the direction in
+which a world entity is supposed to move, if in the heading interaction mode.
+
+#### Server Prots
+1. SET_INTERACTION_MODE: Used to change the tile and entity interaction modes
+in the client, which allows one to disable all clicks, allow walking or
+selecting a ship's heading. Additionally, allows one to disable interactions
+with any entities (or go in examine-only mode).
+2. RESET_INTERACTION_MODE: Undoes the effects of SET_INTERACTION_MODE.
+3. WORLDENTITY_INFO_V3: A new variant of worldentity info which reads the coord
+as coord fine, rather than coord grid. This allows server to define sub-tile
+precision of where a worldentity is supposed to be or go to.
+4. NPC_INFO_SMALL_V5: A new variant which uses 6 bits for small NPC info,
+rather than the previous 5 when adding new NPCs to high resolution view.
+This was intended to increase the render distance for the wilderness world
+boss that was supposed to come. A new LARGE variant of this packet exists
+also, but that is unchanged compared to the V4 variant.
+5. OBJ_CUSTOMISE zone prot, allowing the server to change the colours,
+textures and model of an item on the ground.
+6. OBJ_UNCUSTOMISE zone prot, resetting any customisations done to an item
+on the ground.
 
 ### Revision 225
 Revision 225 brought a small-scale refactoring to the player info packet,

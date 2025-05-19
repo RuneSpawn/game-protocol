@@ -6,6 +6,7 @@ import io.netty.buffer.PooledByteBufAllocator
 import net.rsprot.compression.provider.HuffmanCodecProvider
 import net.rsprot.crypto.rsa.RsaKeyPair
 import net.rsprot.protocol.api.bootstrap.BootstrapFactory
+import net.rsprot.protocol.api.config.NetworkConfiguration
 import net.rsprot.protocol.api.handlers.ExceptionHandlers
 import net.rsprot.protocol.api.handlers.GameMessageHandlers
 import net.rsprot.protocol.api.handlers.INetAddressHandlers
@@ -16,6 +17,7 @@ import net.rsprot.protocol.api.suppliers.NpcInfoSupplier
 import net.rsprot.protocol.api.suppliers.PlayerInfoSupplier
 import net.rsprot.protocol.api.suppliers.WorldEntityInfoSupplier
 import net.rsprot.protocol.common.client.OldSchoolClientType
+import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcAvatarFilter
 import net.rsprot.protocol.message.codec.incoming.provider.GameMessageConsumerRepositoryProvider
 
 /**
@@ -38,6 +40,12 @@ public abstract class AbstractNetworkServiceFactory<R> {
      */
     public open val allocator: ByteBufAllocator
         get() = PooledByteBufAllocator.DEFAULT
+
+    /**
+     * The host to which to bind to, defaulting to null.
+     */
+    public open val host: String?
+        get() = null
 
     /**
      * The list of ports to listen to. Typically, the server should listen to ports
@@ -82,6 +90,24 @@ public abstract class AbstractNetworkServiceFactory<R> {
      */
     public open val betaWorld: Boolean
         get() = false
+
+    /**
+     * The maximum number of zone buffers that can be computed in one game cycle
+     * before the computation code begins to warn the user about a potential leak.
+     */
+    public open val zoneCountBeforeLeakWarning: Int
+        get() = DEFAULT_ZONE_COUNT_BEFORE_LEAK_WARNING
+
+    /**
+     * The maximum number of game cycles a zone buffer will be kept around for
+     * before forcibly releasing it. This is secondary validation in case
+     * a buffer is written over to Netty, but something happens with the
+     * connection behind it and the packet actually never gets written over
+     * or released - so this code will ensure that once the time is up, that
+     * buffer still is released.
+     */
+    public open val bufRetentionCountBeforeRelease: Int
+        get() = DEFAULT_BUF_RETENTION_COUNT_BEFORE_RELEASE
 
     /**
      * Gets the bootstrap factory used to register the network service.
@@ -248,11 +274,36 @@ public abstract class AbstractNetworkServiceFactory<R> {
     public open fun getLoginHandlers(): LoginHandlers = LoginHandlers()
 
     /**
+     * Gets the network configuration builder, allowing one to modify various criteria regarding
+     * their network preferences.
+     */
+    public open fun getNetworkConfiguration(): NetworkConfiguration.Builder = NetworkConfiguration.Builder()
+
+    /**
+     * Gets the NPC avatar filter - a requirement for adding/keeping NPCs in high resolution.
+     * This is a server-side filter that can be customized to ones needs.
+     */
+    public open fun getNpcAvatarFilter(): NpcAvatarFilter? {
+        return null
+    }
+
+    /**
+     * A Kotlin-only helper function to build a network configuration builder.
+     */
+    @JvmSynthetic
+    public fun configure(block: (NetworkConfiguration.Builder).() -> Unit): NetworkConfiguration.Builder {
+        val builder = NetworkConfiguration.Builder()
+        block(builder)
+        return builder
+    }
+
+    /**
      * Builds a network service through this factoring, using all
      * the information provided in here.
      */
     public fun build(): NetworkService<R> {
         val allocator = this.allocator
+        val host = this.host
         val ports = this.ports
         val supportedClientTypes = this.supportedClientTypes
         val huffman = getHuffmanCodecProvider()
@@ -264,9 +315,11 @@ public abstract class AbstractNetworkServiceFactory<R> {
                 getPlayerInfoSupplier(),
                 getNpcInfoSupplier(),
                 getWorldEntityInfoSupplier(),
+                getNpcAvatarFilter(),
             )
         return NetworkService(
             allocator,
+            host,
             ports,
             betaWorld,
             getBootstrapFactory(),
@@ -277,6 +330,9 @@ public abstract class AbstractNetworkServiceFactory<R> {
             getINetAddressHandlers(),
             getGameMessageHandlers(),
             getLoginHandlers(),
+            getNetworkConfiguration().build(),
+            zoneCountBeforeLeakWarning,
+            bufRetentionCountBeforeRelease,
             huffman,
             getGameMessageConsumerRepositoryProvider(),
             getRsaKeyPair(),
@@ -287,5 +343,8 @@ public abstract class AbstractNetworkServiceFactory<R> {
 
     private companion object {
         private val logger = InlineLogger()
+
+        private const val DEFAULT_ZONE_COUNT_BEFORE_LEAK_WARNING: Int = 25_000
+        private const val DEFAULT_BUF_RETENTION_COUNT_BEFORE_RELEASE: Int = 100
     }
 }

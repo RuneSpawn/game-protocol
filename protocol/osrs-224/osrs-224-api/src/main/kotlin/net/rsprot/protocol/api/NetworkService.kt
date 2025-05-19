@@ -7,6 +7,7 @@ import io.netty.channel.EventLoopGroup
 import net.rsprot.compression.provider.HuffmanCodecProvider
 import net.rsprot.crypto.rsa.RsaKeyPair
 import net.rsprot.protocol.api.bootstrap.BootstrapFactory
+import net.rsprot.protocol.api.config.NetworkConfiguration
 import net.rsprot.protocol.api.handlers.ExceptionHandlers
 import net.rsprot.protocol.api.handlers.GameMessageHandlers
 import net.rsprot.protocol.api.handlers.INetAddressHandlers
@@ -17,6 +18,7 @@ import net.rsprot.protocol.api.js5.Js5Service
 import net.rsprot.protocol.api.repositories.MessageDecoderRepositories
 import net.rsprot.protocol.api.repositories.MessageEncoderRepositories
 import net.rsprot.protocol.api.util.asCompletableFuture
+import net.rsprot.protocol.common.RSProtConstants
 import net.rsprot.protocol.common.client.OldSchoolClientType
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcAvatarFactory
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcInfoProtocol
@@ -25,7 +27,9 @@ import net.rsprot.protocol.game.outgoing.info.worldentityinfo.WorldEntityAvatarF
 import net.rsprot.protocol.game.outgoing.info.worldentityinfo.WorldEntityProtocol
 import net.rsprot.protocol.message.codec.incoming.provider.GameMessageConsumerRepositoryProvider
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import kotlin.time.measureTime
 
 /**
@@ -33,6 +37,7 @@ import kotlin.time.measureTime
  * in a single "god" object.
  * @param R the receiver type for the incoming game message consumers, typically a player
  * @property allocator the byte buffer allocator used throughout the library
+ * @property host the host to which to bind to, defaulting to null.
  * @property ports the list of ports that the service will connect to
  * @property betaWorld whether this world is a beta world
  * @property bootstrapFactory the bootstrap factory used to configure the socket and Netty
@@ -70,6 +75,7 @@ import kotlin.time.measureTime
 public class NetworkService<R>
     internal constructor(
         internal val allocator: ByteBufAllocator,
+        internal val host: String?,
         internal val ports: List<Int>,
         internal val betaWorld: Boolean,
         internal val bootstrapFactory: BootstrapFactory,
@@ -80,6 +86,7 @@ public class NetworkService<R>
         internal val iNetAddressHandlers: INetAddressHandlers,
         internal val gameMessageHandlers: GameMessageHandlers,
         internal val loginHandlers: LoginHandlers,
+        internal val configuration: NetworkConfiguration,
         public val huffmanCodecProvider: HuffmanCodecProvider,
         public val gameMessageConsumerRepositoryProvider: GameMessageConsumerRepositoryProvider<R>,
         rsaKeyPair: RsaKeyPair,
@@ -108,7 +115,7 @@ public class NetworkService<R>
 
         private lateinit var bossGroup: EventLoopGroup
         private lateinit var childGroup: EventLoopGroup
-        private lateinit var js5PrefetchFuture: ScheduledFuture<*>
+        private lateinit var js5PrefetchService: ScheduledExecutorService
 
         /**
          * Starts the network service by binding the provided ports.
@@ -127,9 +134,10 @@ public class NetworkService<R>
                             .childHandler(
                                 LoginChannelInitializer(this),
                             )
+                    val host = this.host
                     val futures =
                         ports
-                            .map(initializer::bind)
+                            .map { if (host != null) initializer.bind(host, it) else initializer.bind(it) }
                             .map<ChannelFuture, CompletableFuture<Void>>(ChannelFuture::asCompletableFuture)
                     val future =
                         CompletableFuture
@@ -142,7 +150,7 @@ public class NetworkService<R>
                                 }
                             }
                     js5ServiceExecutor.start()
-                    js5PrefetchFuture = Js5Service.startPrefetching(js5Service)
+                    js5PrefetchService = Js5Service.startPrefetching(js5Service)
                     try {
                         // join it, which will propagate any exceptions
                         future.join()
@@ -153,7 +161,7 @@ public class NetworkService<R>
                 }
             logger.info { "Started in: $time" }
             logger.info { "Bound to ports: ${ports.joinToString(", ")}" }
-            logger.info { "Revision: $REVISION" }
+            logger.info { "Revision: ${RSProtConstants.REVISION}" }
             val clientTypeNames =
                 clientTypes.joinToString(", ") {
                     it.name.lowercase().replaceFirstChar(Char::uppercase)
@@ -164,10 +172,22 @@ public class NetworkService<R>
         public fun shutdown() {
             logger.info { "Attempting to shut down network service." }
             js5Service.triggerShutdown()
-            js5PrefetchFuture.cancel(true)
+            js5PrefetchService.safeShutdown()
             bossGroup.shutdownGracefully()
             childGroup.shutdownGracefully()
             logger.info { "Network service successfully shut down." }
+        }
+
+        private fun ExecutorService.safeShutdown() {
+            shutdown()
+            try {
+                if (!awaitTermination(3L, TimeUnit.SECONDS)) {
+                    shutdownNow()
+                }
+            } catch (_: InterruptedException) {
+                shutdownNow()
+                Thread.currentThread().interrupt()
+            }
         }
 
         /**
@@ -176,7 +196,6 @@ public class NetworkService<R>
         public fun isSupported(clientType: OldSchoolClientType): Boolean = clientType in clientTypes
 
         public companion object {
-            public const val REVISION: Int = 224
             public const val INITIAL_TIMEOUT_SECONDS: Long = 30
             public const val LOGIN_TIMEOUT_SECONDS: Long = 40
             public const val GAME_TIMEOUT_SECONDS: Long = 15

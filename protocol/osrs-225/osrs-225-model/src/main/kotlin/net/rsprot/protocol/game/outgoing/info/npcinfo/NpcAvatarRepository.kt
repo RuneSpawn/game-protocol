@@ -2,10 +2,11 @@ package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import io.netty.buffer.ByteBufAllocator
 import net.rsprot.compression.provider.HuffmanCodecProvider
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.npcinfo.NpcAvatarDetails
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.game.outgoing.info.AvatarPriority
 import net.rsprot.protocol.game.outgoing.info.filter.ExtendedInfoFilter
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.npcinfo.NpcAvatarDetails
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 import java.lang.ref.ReferenceQueue
 import java.lang.ref.SoftReference
 
@@ -23,6 +24,8 @@ import java.lang.ref.SoftReference
  * it be passed in, so we must still provide it.
  * @property zoneIndexStorage the zone index storage responsible for tracking all the NPCs
  * based on the zones in which they lie.
+ * @property npcInfoProtocolSupplier a supplier for the npc info protocol. This is a cheap hack
+ * to get around a circular dependency issue without rewriting a great deal of code.
  */
 internal class NpcAvatarRepository(
     private val allocator: ByteBufAllocator,
@@ -30,6 +33,7 @@ internal class NpcAvatarRepository(
     private val extendedInfoWriter: List<NpcAvatarExtendedInfoWriter>,
     private val huffmanCodec: HuffmanCodecProvider,
     private val zoneIndexStorage: ZoneIndexStorage,
+    private val npcInfoProtocolSupplier: DeferredNpcInfoProtocolSupplier,
 ) {
     /**
      * The array of npc avatars that currently exist in the game.
@@ -80,6 +84,11 @@ internal class NpcAvatarRepository(
      * @param spawnCycle the game cycle on which the npc spawned into the world;
      * for static NPCs, this would always be zero. This is only used by the C++ clients.
      * @param direction the direction that the npc will face on spawn (see table above)
+     * @param priority the priority group a NPC belongs into. See [NpcInfo.setPriorityCaps] for greater
+     * documentation.
+     * @param specific if true, the NPC will only render to players that have explicitly marked this
+     * NPC's index as specific-visible, anyone else will be unable to see it. If it's false, anyone can
+     * see the NPC regardless.
      * @return a npc avatar with the above provided details.
      */
     fun getOrAlloc(
@@ -90,7 +99,12 @@ internal class NpcAvatarRepository(
         z: Int,
         spawnCycle: Int = 0,
         direction: Int = 0,
+        priority: AvatarPriority = AvatarPriority.NORMAL,
+        specific: Boolean = false,
     ): NpcAvatar {
+        require(this.elements[index] == null) {
+            "NPC Avatar with index $index is already allocated!"
+        }
         val existing = queue.poll()?.get()
         if (existing != null) {
             existing.resetObservers()
@@ -98,12 +112,18 @@ internal class NpcAvatarRepository(
             resetTransientDetails(details)
             details.index = index
             details.id = id
-            details.currentCoord = CoordGrid(level, x, z)
+            details.currentCoord =
+                CoordGrid(level, x, z)
             details.spawnCycle = spawnCycle
             details.direction = direction
             details.allocateCycle = NpcInfoProtocol.cycleCount
+            details.priorityBitcode = priority.bitcode
+            details.specific = specific
             zoneIndexStorage.add(index, details.currentCoord)
             elements[index] = existing
+            if (id > 16383) {
+                existing.extendedInfo.setTransmogrification(id)
+            }
             return existing
         }
         val extendedInfo =
@@ -123,10 +143,15 @@ internal class NpcAvatarRepository(
                 z,
                 spawnCycle,
                 direction,
+                priority,
+                specific,
                 NpcInfoProtocol.cycleCount,
                 extendedInfo,
                 zoneIndexStorage,
             )
+        if (id > 16383) {
+            extendedInfo.setTransmogrification(id)
+        }
         zoneIndexStorage.add(index, avatar.details.currentCoord)
         elements[index] = avatar
         return avatar
@@ -137,8 +162,20 @@ internal class NpcAvatarRepository(
      * @param avatar the avatar to release.
      */
     fun release(avatar: NpcAvatar) {
-        zoneIndexStorage.remove(avatar.details.index, avatar.details.currentCoord)
-        this.elements[avatar.details.index] = null
+        val index = avatar.details.index
+        // Ensure the avatars share the same reference!
+        require(this.elements[index] === avatar) {
+            "Attempting to release an invalid NPC avatar: $avatar, ${this.elements[index]}"
+        }
+        if (avatar.details.specific) {
+            val protocol = npcInfoProtocolSupplier.get()
+            for (i in 0..<NpcInfoProtocol.PROTOCOL_CAPACITY) {
+                val info = protocol.getOrNull(i) ?: continue
+                info.unsetSpecific(index)
+            }
+        }
+        zoneIndexStorage.remove(index, avatar.details.currentCoord)
+        this.elements[index] = null
         avatar.extendedInfo.reset()
         val reference = SoftReference(avatar, queue)
         reference.enqueue()

@@ -4,22 +4,23 @@ import io.netty.buffer.PooledByteBufAllocator
 import io.netty.buffer.Unpooled
 import net.rsprot.compression.HuffmanCodec
 import net.rsprot.compression.provider.DefaultHuffmanCodecProvider
-import net.rsprot.protocol.common.client.ClientTypeMap
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
 import net.rsprot.protocol.game.outgoing.codec.npcinfo.DesktopLowResolutionChangeEncoder
 import net.rsprot.protocol.game.outgoing.codec.npcinfo.extendedinfo.writer.NpcAvatarExtendedInfoDesktopWriter
 import net.rsprot.protocol.game.outgoing.info.filter.DefaultExtendedInfoFilter
+import net.rsprot.protocol.game.outgoing.info.npcinfo.DeferredNpcInfoProtocolSupplier
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcAvatar
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcAvatarExceptionHandler
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcAvatarFactory
-import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcIndexSupplier
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcInfo
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcInfoLarge
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcInfoProtocol
 import net.rsprot.protocol.game.outgoing.info.npcinfo.NpcInfoSmall
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.worker.DefaultProtocolWorker
+import net.rsprot.protocol.internal.client.ClientTypeMap
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 import org.openjdk.jmh.annotations.Benchmark
 import org.openjdk.jmh.annotations.BenchmarkMode
 import org.openjdk.jmh.annotations.Fork
@@ -41,26 +42,34 @@ import kotlin.random.Random
 @Measurement(iterations = 3, time = 10, timeUnit = TimeUnit.SECONDS)
 @Fork(3)
 class NpcInfoBenchmark {
+    init {
+        System.setProperty("net.rsprot.protocol.internal.npcPlayerAvatarTracking", "true")
+    }
+
     private lateinit var protocol: NpcInfoProtocol
     private val random: Random = Random(0)
     private lateinit var serverNpcs: List<Npc>
-    private lateinit var supplier: NpcIndexSupplier
     private lateinit var localNpcInfo: NpcInfo
     private lateinit var otherNpcInfos: List<NpcInfo>
-    private var localPlayerCoord = CoordGrid(0, 3207, 3207)
+    private var localPlayerCoord =
+        CoordGrid(0, 3207, 3207)
+    private lateinit var factory: NpcAvatarFactory
 
     @Setup
     fun setup() {
         val allocator = PooledByteBufAllocator.DEFAULT
-        val factory =
+        val storage = ZoneIndexStorage(ZoneIndexStorage.NPC_CAPACITY)
+        val protocolSupplier = DeferredNpcInfoProtocolSupplier()
+        this.factory =
             NpcAvatarFactory(
                 allocator,
                 DefaultExtendedInfoFilter(),
                 listOf(NpcAvatarExtendedInfoDesktopWriter()),
                 DefaultHuffmanCodecProvider(createHuffmanCodec()),
+                storage,
+                protocolSupplier,
             )
         this.serverNpcs = createPhantomNpcs(factory)
-        this.supplier = createNpcIndexSupplier()
 
         val encoders =
             ClientTypeMap.of(
@@ -72,12 +81,13 @@ class NpcInfoBenchmark {
         protocol =
             NpcInfoProtocol(
                 allocator,
-                supplier,
                 encoders,
                 factory,
                 npcExceptionHandler(),
                 DefaultProtocolWorker(1, ForkJoinPool.commonPool()),
+                storage,
             )
+        protocolSupplier.supply(protocol)
         this.localNpcInfo = protocol.alloc(1, OldSchoolClientType.DESKTOP)
         otherNpcInfos = (2..2046).map { protocol.alloc(it, OldSchoolClientType.DESKTOP) }
         val infos = otherNpcInfos + localNpcInfo
@@ -94,8 +104,8 @@ class NpcInfoBenchmark {
     }
 
     private fun npcExceptionHandler(): NpcAvatarExceptionHandler =
-        NpcAvatarExceptionHandler { _, _ ->
-            // No-op
+        NpcAvatarExceptionHandler { _, e ->
+            e.printStackTrace()
         }
 
     @Benchmark
@@ -116,7 +126,9 @@ class NpcInfoBenchmark {
         protocol.update()
         for (i in 1..2046) {
             val info = protocol[i]
-            when (val packet = info.toNpcInfoPacket(NpcInfo.ROOT_WORLD)) {
+            val packet = info.toPacket(NpcInfo.ROOT_WORLD)
+            packet.markConsumed()
+            when (packet) {
                 is NpcInfoSmall -> packet.release()
                 is NpcInfoLarge -> packet.release()
                 else -> throw IllegalStateException("Unknown packet type: $packet")
@@ -127,23 +139,14 @@ class NpcInfoBenchmark {
         }
     }
 
-    private fun createNpcIndexSupplier(): NpcIndexSupplier =
-        NpcIndexSupplier { _, level, x, z, viewDistance ->
-            serverNpcs
-                .asSequence()
-                .filter { it.coordGrid.inDistance(CoordGrid(level, x, z), viewDistance) }
-                .take(250)
-                .mapTo(ArrayList(250)) { it.index }
-                .iterator()
-        }
-
     private fun createPhantomNpcs(factory: NpcAvatarFactory): List<Npc> {
         val npcs = ArrayList<Npc>(500)
         for (index in 0..<500) {
             val x = random.nextInt(3200, 3213)
             val z = random.nextInt(3200, 3213)
             val id = (index * x * z) and 0x3FFF
-            val coord = CoordGrid(0, x, z)
+            val coord =
+                CoordGrid(0, x, z)
             npcs +=
                 Npc(
                     index,
@@ -165,9 +168,6 @@ class NpcInfoBenchmark {
         val id: Int,
         val avatar: NpcAvatar,
     ) {
-        val coordGrid: CoordGrid
-            get() = avatar.getCoordGrid()
-
         override fun toString(): String =
             "Npc(" +
                 "index=$index, " +

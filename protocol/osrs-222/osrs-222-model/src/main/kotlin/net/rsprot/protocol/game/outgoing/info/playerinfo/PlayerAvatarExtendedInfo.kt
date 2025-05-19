@@ -5,20 +5,20 @@ package net.rsprot.protocol.game.outgoing.info.playerinfo
 import io.netty.buffer.ByteBufAllocator
 import net.rsprot.buffer.JagByteBuf
 import net.rsprot.compression.provider.HuffmanCodecProvider
-import net.rsprot.protocol.common.RSProtFlags
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.playerinfo.encoder.PlayerExtendedInfoEncoders
-import net.rsprot.protocol.common.game.outgoing.info.playerinfo.extendedinfo.FaceAngle
-import net.rsprot.protocol.common.game.outgoing.info.playerinfo.extendedinfo.MoveSpeed
-import net.rsprot.protocol.common.game.outgoing.info.playerinfo.extendedinfo.ObjTypeCustomisation
-import net.rsprot.protocol.common.game.outgoing.info.precompute
-import net.rsprot.protocol.common.game.outgoing.info.shared.extendedinfo.FacePathingEntity
-import net.rsprot.protocol.common.game.outgoing.info.shared.extendedinfo.Tinting
-import net.rsprot.protocol.common.game.outgoing.info.shared.extendedinfo.util.HeadBar
-import net.rsprot.protocol.common.game.outgoing.info.shared.extendedinfo.util.HitMark
-import net.rsprot.protocol.common.game.outgoing.info.shared.extendedinfo.util.SpotAnim
 import net.rsprot.protocol.game.outgoing.info.AvatarExtendedInfoWriter
 import net.rsprot.protocol.game.outgoing.info.filter.ExtendedInfoFilter
+import net.rsprot.protocol.internal.RSProtFlags
+import net.rsprot.protocol.internal.game.outgoing.info.playerinfo.encoder.PlayerExtendedInfoEncoders
+import net.rsprot.protocol.internal.game.outgoing.info.playerinfo.extendedinfo.FaceAngle
+import net.rsprot.protocol.internal.game.outgoing.info.playerinfo.extendedinfo.MoveSpeed
+import net.rsprot.protocol.internal.game.outgoing.info.playerinfo.extendedinfo.ObjTypeCustomisation
+import net.rsprot.protocol.internal.game.outgoing.info.precompute
+import net.rsprot.protocol.internal.game.outgoing.info.shared.extendedinfo.FacePathingEntity
+import net.rsprot.protocol.internal.game.outgoing.info.shared.extendedinfo.Tinting
+import net.rsprot.protocol.internal.game.outgoing.info.shared.extendedinfo.util.HeadBar
+import net.rsprot.protocol.internal.game.outgoing.info.shared.extendedinfo.util.HitMark
+import net.rsprot.protocol.internal.game.outgoing.info.shared.extendedinfo.util.SpotAnim
 
 public typealias PlayerAvatarExtendedInfoWriter =
     AvatarExtendedInfoWriter<PlayerExtendedInfoEncoders, PlayerAvatarExtendedInfoBlocks>
@@ -80,6 +80,15 @@ public class PlayerAvatarExtendedInfo(
      * The last player info cycle on which our appearance changed.
      */
     private var lastAppearanceChangeCycle: Int = 0
+
+    /**
+     * A storage of all the observed chat messages that a player saw in a tick.
+     */
+    public val observedChatStorage: ObservedChatStorage =
+        ObservedChatStorage(
+            RSProtFlags.captureChat,
+            RSProtFlags.captureSay,
+        )
 
     /**
      * Invalidates the appearance cache.
@@ -330,9 +339,6 @@ public class PlayerAvatarExtendedInfo(
             require(delay2 >= 0) {
                 "Second delay cannot be negative: $delay2"
             }
-            require(delay2 > delay1) {
-                "Second delay must be greater than the first: $delay1 > $delay2"
-            }
             require(angle in 0..2047) {
                 "Unexpected angle value: $angle, expected range: 0..2047"
             }
@@ -374,8 +380,8 @@ public class PlayerAvatarExtendedInfo(
         height: Int,
     ) {
         verify {
-            require(slot in UNSIGNED_BYTE_RANGE) {
-                "Unexpected slot: $slot, expected range: $UNSIGNED_BYTE_RANGE"
+            require(slot in 0..<RSProtFlags.spotanimListCapacity) {
+                "Unexpected slot: $slot, expected range: 0..<${RSProtFlags.spotanimListCapacity}"
             }
             require(id == -1 || id in UNSIGNED_SHORT_RANGE) {
                 "Unexpected id: $id, expected value -1 or in range: $UNSIGNED_SHORT_RANGE"
@@ -400,7 +406,8 @@ public class PlayerAvatarExtendedInfo(
      * The index will be used for tinting purposes, as both the player who dealt
      * the hit, and the recipient will see a tinted variant.
      * Everyone else, however, will see a regular darkened hit mark.
-     * @param selfType the multi hitmark id that supports tinted and darkened variants.
+     * @param selfType the multi hitmark id that supports tinted and darkened variants. This one renders
+     * to the player who received the hit, as well as the one who dealt it.
      * @param otherType the hitmark id to render to anyone that isn't the recipient,
      * or the one who dealt the hit. This will generally be a darkened variant.
      * If the hitmark should only render to the local player, set the [otherType]
@@ -416,30 +423,76 @@ public class PlayerAvatarExtendedInfo(
         value: Int,
         delay: Int = 0,
     ) {
+        addHitMark(
+            sourceIndex,
+            selfType,
+            selfType,
+            otherType,
+            value,
+            delay,
+        )
+    }
+
+    /**
+     * Adds a simple hitmark on this avatar.
+     * @param sourceIndex the index of the character that dealt the hit.
+     * If the target avatar is a player, add 0x10000 to the real index value (0-2048).
+     * If the target avatar is a NPC, set the index as it is.
+     * If there is no source, set the index to -1.
+     * The index will be used for tinting purposes, as both the player who dealt
+     * the hit, and the recipient will see a tinted variant.
+     * Everyone else, however, will see a regular darkened hit mark.
+     * @param selfType the multi hitmark id that supports tinted and darkened variants. This one renders
+     * to the player who received the hit.
+     * @param sourceType the multi hitmark id that supports tinted and darkened variants. This one renders
+     * to the player who dealt the hit, as defined according to [sourceIndex].
+     * @param otherType the hitmark id to render to anyone that isn't the recipient,
+     * or the one who dealt the hit. This will generally be a darkened variant.
+     * If the hitmark should only render to the local player, set the [otherType]
+     * value to -1, forcing it to only render to the recipient (and in the case of
+     * a [sourceIndex] being defined with the respective [sourceType], the one who dealt the hit)
+     * @param value the value to show over the hitmark.
+     * @param delay the delay in client cycles (20ms/cc) until the hitmark renders.
+     */
+    public fun addHitMark(
+        sourceIndex: Int,
+        selfType: Int,
+        sourceType: Int,
+        otherType: Int,
+        value: Int,
+        delay: Int = 0,
+    ) {
         if (blocks.hit.hitMarkList.size >= 0xFF) {
             return
         }
         verify {
+            // Index being incorrect would not lead to a crash
             require(sourceIndex == -1 || sourceIndex in 0..0x107FF) {
                 "Unexpected source index: $sourceIndex, expected values: -1 to reset, " +
                     "0-65535 for NPCs, 65536-67583 for players"
             }
-            require(selfType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected selfType: $selfType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(otherType == -1 || otherType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected otherType: $otherType, expected value -1 or range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(value in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected value: $value, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(delay in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected delay: $delay, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
+        }
+
+        // All the properties below here would result in a crash if an invalid input was provided.
+        require(selfType in HIT_TYPE_RANGE) {
+            "Unexpected selfType: $selfType, expected range $HIT_TYPE_RANGE"
+        }
+        require(sourceType in HIT_TYPE_RANGE) {
+            "Unexpected sourceType: $sourceType, expected range $HIT_TYPE_RANGE"
+        }
+        require(otherType in HIT_TYPE_RANGE) {
+            "Unexpected otherType: $otherType, expected range $HIT_TYPE_RANGE"
+        }
+        require(value in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected value: $value, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(delay in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected delay: $delay, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
         }
         blocks.hit.hitMarkList +=
             HitMark(
                 sourceIndex,
+                sourceType.toUShort(),
                 selfType.toUShort(),
                 otherType.toUShort(),
                 value.toUShort(),
@@ -457,10 +510,8 @@ public class PlayerAvatarExtendedInfo(
         if (blocks.hit.hitMarkList.size >= 0xFF) {
             return
         }
-        verify {
-            require(delay in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected delay: $delay, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
+        require(delay in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected delay: $delay, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
         }
         blocks.hit.hitMarkList += HitMark(0x7FFEu, delay.toUShort())
         flags = flags or HITS
@@ -476,6 +527,8 @@ public class PlayerAvatarExtendedInfo(
      * the hit, and the recipient will see a tinted variant.
      * Everyone else, however, will see a regular darkened hit mark.
      * @param selfType the multi hitmark id that supports tinted and darkened variants.
+     * This is the one that renders to the one who receives the hit, as well as the
+     * one who dealt it.
      * @param otherType the hitmark id to render to anyone that isn't the recipient,
      * or the one who dealt the hit. This will generally be a darkened variant.
      * If the hitmark should only render to the local player, set the [otherType]
@@ -483,7 +536,8 @@ public class PlayerAvatarExtendedInfo(
      * a [sourceIndex] being defined, the one who dealt the hit)
      * @param value the value to show over the hitmark.
      * @param selfSoakType the multi hitmark id that supports tinted and darkened variants,
-     * shown as soaking next to the normal hitmark.
+     * shown as soaking next to the normal hitmark. This one renders to the one who receives
+     * the hit, as well as the one who dealt the hit.
      * @param otherSoakType the hitmark id to render to anyone that isn't the recipient,
      * or the one who dealt the hit. This will generally be a darkened variant.
      * Unlike the [otherType], this does not support -1, as it is not possible to show partial
@@ -501,42 +555,111 @@ public class PlayerAvatarExtendedInfo(
         soakValue: Int,
         delay: Int = 0,
     ) {
+        addSoakedHitMark(
+            sourceIndex,
+            selfType,
+            selfType,
+            otherType,
+            value,
+            selfSoakType,
+            selfSoakType,
+            otherSoakType,
+            soakValue,
+            delay,
+        )
+    }
+
+    /**
+     * Adds a simple hitmark on this avatar.
+     * @param sourceIndex the index of the character that dealt the hit.
+     * If the target avatar is a player, add 0x10000 to the real index value (0-2048).
+     * If the target avatar is a NPC, set the index as it is.
+     * If there is no source, set the index to -1.
+     * The index will be used for tinting purposes, as both the player who dealt
+     * the hit, and the recipient will see a tinted variant.
+     * Everyone else, however, will see a regular darkened hit mark.
+     * @param selfType the multi hitmark id that supports tinted and darkened variants.
+     * This is the one that renders to the one who receives the hit.
+     * @param sourceSoakType This is the one that renders to the one who dealt the hit,
+     * defined according to [sourceIndex].
+     * @param otherType the hitmark id to render to anyone that isn't the recipient,
+     * or the one who dealt the hit. This will generally be a darkened variant.
+     * If the hitmark should only render to the local player, set the [otherType]
+     * value to -1, forcing it to only render to the recipient (and in the case of
+     * a [sourceIndex] being defined with the respective [sourceType], the one who dealt the hit)
+     * @param value the value to show over the hitmark.
+     * @param selfSoakType the multi hitmark id that supports tinted and darkened variants,
+     * shown as soaking next to the normal hitmark. This one renders to the one who receives
+     * the hit.
+     * @param sourceSoakType the multi hitmark id that supports tinted and darkened variants,
+     * shown as soaking next to the normal hitmark. This one renders to the one who dealt
+     * the hit.
+     * @param otherSoakType the hitmark id to render to anyone that isn't the recipient,
+     * or the one who dealt the hit. This will generally be a darkened variant.
+     * Unlike the [otherType], this does not support -1, as it is not possible to show partial
+     * soaked hitmarks.
+     * @param delay the delay in client cycles (20ms/cc) until the hitmark renders.
+     */
+    @JvmOverloads
+    public fun addSoakedHitMark(
+        sourceIndex: Int,
+        selfType: Int,
+        sourceType: Int,
+        otherType: Int,
+        value: Int,
+        selfSoakType: Int,
+        sourceSoakType: Int,
+        otherSoakType: Int,
+        soakValue: Int,
+        delay: Int = 0,
+    ) {
         if (blocks.hit.hitMarkList.size >= 0xFF) {
             return
         }
         verify {
+            // Index being incorrect would not lead to a crash
             require(sourceIndex == -1 || sourceIndex in 0..0x107FF) {
                 "Unexpected source index: $sourceIndex, expected values: -1 to reset, " +
                     "0-65535 for NPCs, 65536-67583 for players"
             }
-            require(selfType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected selfType: $selfType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(otherType == -1 || otherType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected otherType: $otherType, expected value -1 or in range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(value in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected value: $value, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(selfSoakType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected selfType: $selfSoakType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(otherSoakType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected otherType: $otherSoakType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(soakValue in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected value: $soakValue, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(delay in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected delay: $delay, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
+        }
+
+        // All the properties below here would result in a crash if an invalid input was provided.
+        require(selfType in HIT_TYPE_RANGE) {
+            "Unexpected selfType: $selfType, expected range $HIT_TYPE_RANGE"
+        }
+        require(sourceType in HIT_TYPE_RANGE) {
+            "Unexpected sourceType: $sourceType, expected range $HIT_TYPE_RANGE"
+        }
+        require(otherType in HIT_TYPE_RANGE) {
+            "Unexpected otherType: $otherType, expected range $HIT_TYPE_RANGE"
+        }
+        require(value in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected value: $value, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(selfSoakType in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected selfSoakType: $selfSoakType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(sourceSoakType in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected sourceSoakType: $sourceSoakType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(otherSoakType in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected otherSoakType: $otherSoakType, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(soakValue in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected soakValue: $soakValue, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(delay in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected delay: $delay, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
         }
         blocks.hit.hitMarkList +=
             HitMark(
                 sourceIndex,
+                sourceType.toUShort(),
                 selfType.toUShort(),
                 otherType.toUShort(),
                 value.toUShort(),
+                sourceSoakType.toUShort(),
                 selfSoakType.toUShort(),
                 otherSoakType.toUShort(),
                 soakValue.toUShort(),
@@ -582,31 +705,35 @@ public class PlayerAvatarExtendedInfo(
             return
         }
         verify {
+            // Index being incorrect would not lead to a crash
             require(sourceIndex == -1 || sourceIndex in 0..0x107FF) {
                 "Unexpected source index: $sourceIndex, expected values: -1 to reset, " +
                     "0-65535 for NPCs, 65536-67583 for players"
             }
-            require(selfType == -1 || selfType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected id: $selfType, expected value -1 or in range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(otherType == -1 || otherType in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected id: $otherType, expected value -1 or in range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
+            // Fills are transmitted via a byte so they would not crash
             require(startFill in UNSIGNED_BYTE_RANGE) {
                 "Unexpected startFill: $startFill, expected range $UNSIGNED_BYTE_RANGE"
             }
             require(endFill in UNSIGNED_BYTE_RANGE) {
                 "Unexpected endFill: $endFill, expected range $UNSIGNED_BYTE_RANGE"
             }
-            require(startTime in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected startTime: $startTime, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(endTime in UNSIGNED_SMART_1_OR_2_RANGE) {
-                "Unexpected endTime: $endTime, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
-            }
-            require(endTime >= startTime) {
-                "End time must be greater than or equal to start time: $startTime <= $endTime"
-            }
+        }
+
+        // All the properties below here would result in a crash if an invalid input was provided.
+        require(selfType == -1 || selfType in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected id: $selfType, expected value -1 or in range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(otherType == -1 || otherType in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected id: $otherType, expected value -1 or in range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(startTime in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected startTime: $startTime, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(endTime in UNSIGNED_SMART_1_OR_2_RANGE) {
+            "Unexpected endTime: $endTime, expected range $UNSIGNED_SMART_1_OR_2_RANGE"
+        }
+        require(endTime >= startTime) {
+            "End time must be greater than or equal to start time: $startTime <= $endTime"
         }
         blocks.hit.headBarList +=
             HeadBar(
@@ -643,7 +770,31 @@ public class PlayerAvatarExtendedInfo(
      * @param lightness the lightness of the tint.
      * @param weight the weight (or opacity) of the tint.
      */
+    @Deprecated(
+        message = "Deprecated. Use setTinting(startTime, endTime, hue, saturation, lightness, weight) for consistency.",
+        replaceWith = ReplaceWith("setTinting(startTime, endTime, hue, saturation, lightness, weight)"),
+    )
     public fun tinting(
+        startTime: Int,
+        endTime: Int,
+        hue: Int,
+        saturation: Int,
+        lightness: Int,
+        weight: Int,
+    ) {
+        setTinting(startTime, endTime, hue, saturation, lightness, weight)
+    }
+
+    /**
+     * Applies a tint over the non-textured parts of the character.
+     * @param startTime the delay in client cycles (20ms/cc) until the tinting is applied.
+     * @param endTime the timestamp in client cycles (20ms/cc) until the tinting finishes.
+     * @param hue the hue of the tint.
+     * @param saturation the saturation of the tint.
+     * @param lightness the lightness of the tint.
+     * @param weight the weight (or opacity) of the tint.
+     */
+    public fun setTinting(
         startTime: Int,
         endTime: Int,
         hue: Int,
@@ -695,7 +846,40 @@ public class PlayerAvatarExtendedInfo(
      * @param visibleTo the player who will see the tint applied.
      * Note that this only accepts player indices, and not NPC ones like many other extended info blocks.
      */
+    @Deprecated(
+        message =
+            "Deprecated. Use setSpecificTinting(startTime, endTime, hue, saturation, " +
+                "lightness, weight, visibleTo) for consistency.",
+        replaceWith =
+            ReplaceWith(
+                "setSpecificTinting(startTime, endTime, hue, saturation, " +
+                    "lightness, weight, visibleTo)",
+            ),
+    )
     public fun specificTinting(
+        startTime: Int,
+        endTime: Int,
+        hue: Int,
+        saturation: Int,
+        lightness: Int,
+        weight: Int,
+        visibleTo: PlayerInfo,
+    ) {
+        setSpecificTinting(startTime, endTime, hue, saturation, lightness, weight, visibleTo)
+    }
+
+    /**
+     * Applies a tint over the non-textured parts of the character.
+     * @param startTime the delay in client cycles (20ms/cc) until the tinting is applied.
+     * @param endTime the timestamp in client cycles (20ms/cc) until the tinting finishes.
+     * @param hue the hue of the tint.
+     * @param saturation the saturation of the tint.
+     * @param lightness the lightness of the tint.
+     * @param weight the weight (or opacity) of the tint.
+     * @param visibleTo the player who will see the tint applied.
+     * Note that this only accepts player indices, and not NPC ones like many other extended info blocks.
+     */
+    public fun setSpecificTinting(
         startTime: Int,
         endTime: Int,
         hue: Int,
@@ -809,30 +993,55 @@ public class PlayerAvatarExtendedInfo(
      * Sets the character male or female.
      * @param isMale whether to set the character male (or female, if false)
      */
+    @Deprecated(
+        message = "Deprecated. Use setBodyType(type) for consistency.",
+        replaceWith = ReplaceWith("setBodyType(type)"),
+    )
     public fun setMale(isMale: Boolean) {
-        if (blocks.appearance.male == isMale) {
+        setBodyType(if (isMale) 0 else 1)
+    }
+
+    /**
+     * Sets the body type of the character.
+     * @param type the body type of the character.
+     */
+    public fun setBodyType(type: Int) {
+        if (blocks.appearance.bodyType == type.toUByte()) {
             return
         }
-        blocks.appearance.male = isMale
+        blocks.appearance.bodyType = type.toUByte()
         flagAppearance()
     }
 
     /**
-     * Sets the text gender of this avatar.
+     * Sets the pronoun of this avatar.
      * @param num the number to set, with the value 0 being male, 1 being female,
      * and 2 being 'other'.
      */
+    @Deprecated(
+        message = "Deprecated. Use setPronoun(num) for consistency.",
+        replaceWith = ReplaceWith("setPronoun(num)"),
+    )
     public fun setTextGender(num: Int) {
+        setPronoun(num)
+    }
+
+    /**
+     * Sets the pronoun of this avatar.
+     * @param num the number to set, with the value 0 being male, 1 being female,
+     * and 2 being 'other'.
+     */
+    public fun setPronoun(num: Int) {
         verify {
             require(num in UNSIGNED_BYTE_RANGE) {
                 "Unexpected textGender $num, expected range $UNSIGNED_BYTE_RANGE"
             }
         }
-        val textGender = num.toUByte()
-        if (blocks.appearance.textGender == textGender) {
+        val pronoun = num.toUByte()
+        if (blocks.appearance.pronoun == pronoun) {
             return
         }
-        blocks.appearance.textGender = textGender
+        blocks.appearance.pronoun = pronoun
         flagAppearance()
     }
 
@@ -876,7 +1085,19 @@ public class PlayerAvatarExtendedInfo(
      * Transforms this avatar to the respective NPC, or back to player if the [id] is -1.
      * @param id the id of the NPC to transform to, or -1 if resetting.
      */
+    @Deprecated(
+        message = "Deprecated. Use setTransmogrification(id) for consistency.",
+        replaceWith = ReplaceWith("setTransmogrification(id)"),
+    )
     public fun transformToNpc(id: Int) {
+        setTransmogrification(id)
+    }
+
+    /**
+     * Transforms this avatar to the respective NPC, or back to player if the [id] is -1.
+     * @param id the id of the NPC to transform to, or -1 if resetting.
+     */
+    public fun setTransmogrification(id: Int) {
         verify {
             require(id == -1 || id in UNSIGNED_SHORT_RANGE) {
                 "Unexpected id $id, expected value -1 or in range $UNSIGNED_SHORT_RANGE"
@@ -895,7 +1116,7 @@ public class PlayerAvatarExtendedInfo(
      * as those range from 0 to 11. Ident kit values only range from 0 to 6, which would
      * result in some wasted memory.
      * A list of wearpos to ident kit can also be found in
-     * [net.rsprot.protocol.common.game.outgoing.info.playerinfo.extendedinfo.Appearance.identKitSlotList]
+     * [net.rsprot.protocol.internal.game.outgoing.info.playerinfo.extendedinfo.Appearance.identKitSlotList]
      *
      * Ident kit table:
      * ```kt
@@ -1058,7 +1279,25 @@ public class PlayerAvatarExtendedInfo(
      * @param afterName the text to render after this avatar's name, but before the combat level.
      * @param afterCombatLevel the text to render after this avatar's combat level.
      */
+    @Deprecated(
+        message = "Deprecated. Use setNameExtras(beforeName, afterName, afterCombatLevel) for consistency.",
+        replaceWith = ReplaceWith("setNameExtras(beforeName, afterName, afterCombatLevel)"),
+    )
     public fun nameExtras(
+        beforeName: String,
+        afterName: String,
+        afterCombatLevel: String,
+    ) {
+        setNameExtras(beforeName, afterName, afterCombatLevel)
+    }
+
+    /**
+     * Sets the name extras of this avatar, rendered when right-clicking users.
+     * @param beforeName the text to render before this avatar's name.
+     * @param afterName the text to render after this avatar's name, but before the combat level.
+     * @param afterCombatLevel the text to render after this avatar's combat level.
+     */
+    public fun setNameExtras(
         beforeName: String,
         afterName: String,
         afterCombatLevel: String,
@@ -1085,7 +1324,20 @@ public class PlayerAvatarExtendedInfo(
      * This is particularly important to enable when setting or clearing any obj type customisations,
      * as those are not considered when calculating the hash code.
      */
+    @Deprecated(
+        message = "Deprecated. Use setForceModelRefresh(enabled) for consistency.",
+        replaceWith = ReplaceWith("setForceModelRefresh(enabled)"),
+    )
     public fun forceModelRefresh(enabled: Boolean) {
+        setForceModelRefresh(enabled)
+    }
+
+    /**
+     * Forces a model refresh client-side even if the worn objects + base colour + gender have not changed.
+     * This is particularly important to enable when setting or clearing any obj type customisations,
+     * as those are not considered when calculating the hash code.
+     */
+    public fun setForceModelRefresh(enabled: Boolean) {
         blocks.appearance.forceModelRefresh = enabled
     }
 
@@ -1093,7 +1345,19 @@ public class PlayerAvatarExtendedInfo(
      * Clears any obj type customisations applied to [wearpos].
      * @param wearpos the worn item slot.
      */
+    @Deprecated(
+        message = "Deprecated. Use resetObjTypeCustomisation(wearpos) for consistency.",
+        replaceWith = ReplaceWith("resetObjTypeCustomisation(wearpos)"),
+    )
     public fun clearObjTypeCustomisation(wearpos: Int) {
+        resetObjTypeCustomisation(wearpos)
+    }
+
+    /**
+     * Clears any obj type customisations applied to [wearpos].
+     * @param wearpos the worn item slot.
+     */
+    public fun resetObjTypeCustomisation(wearpos: Int) {
         verify {
             require(wearpos in 0..11) {
                 "Unexpected wearpos $wearpos, expected range 0..11"
@@ -1126,7 +1390,25 @@ public class PlayerAvatarExtendedInfo(
      * @param index the source index of the colour to override.
      * @param value the 16 bit HSL colour to override with.
      */
+    @Deprecated(
+        message = "Deprecated. Use setObjRecol1(wearpos, index, value) for consistency.",
+        replaceWith = ReplaceWith("setObjRecol1(wearpos, index, value)"),
+    )
     public fun objRecol1(
+        wearpos: Int,
+        index: Int,
+        value: Int,
+    ) {
+        setObjRecol1(wearpos, index, value)
+    }
+
+    /**
+     * Recolours part of an obj in the first slot (out of two).
+     * @param wearpos the position in which the obj is worn.
+     * @param index the source index of the colour to override.
+     * @param value the 16 bit HSL colour to override with.
+     */
+    public fun setObjRecol1(
         wearpos: Int,
         index: Int,
         value: Int,
@@ -1154,7 +1436,25 @@ public class PlayerAvatarExtendedInfo(
      * @param index the source index of the colour to override.
      * @param value the 16 bit HSL colour to override with.
      */
+    @Deprecated(
+        message = "Deprecated. Use setObjRecol2(wearpos, index, value) for consistency.",
+        replaceWith = ReplaceWith("setObjRecol2(wearpos, index, value)"),
+    )
     public fun objRecol2(
+        wearpos: Int,
+        index: Int,
+        value: Int,
+    ) {
+        setObjRecol2(wearpos, index, value)
+    }
+
+    /**
+     * Recolours part of an obj in the second slot (out of two).
+     * @param wearpos the position in which the obj is worn.
+     * @param index the source index of the colour to override.
+     * @param value the 16 bit HSL colour to override with.
+     */
+    public fun setObjRecol2(
         wearpos: Int,
         index: Int,
         value: Int,
@@ -1182,7 +1482,25 @@ public class PlayerAvatarExtendedInfo(
      * @param index the source index of the texture to override.
      * @param value the id of the texture to override with.
      */
+    @Deprecated(
+        message = "Deprecated. Use setObjRetex1(wearpos, index, value) for consistency.",
+        replaceWith = ReplaceWith("setObjRetex1(wearpos, index, value)"),
+    )
     public fun objRetex1(
+        wearpos: Int,
+        index: Int,
+        value: Int,
+    ) {
+        setObjRetex1(wearpos, index, value)
+    }
+
+    /**
+     * Retextures part of an obj in the first slot (out of two).
+     * @param wearpos the position in which the obj is worn.
+     * @param index the source index of the texture to override.
+     * @param value the id of the texture to override with.
+     */
+    public fun setObjRetex1(
         wearpos: Int,
         index: Int,
         value: Int,
@@ -1210,7 +1528,25 @@ public class PlayerAvatarExtendedInfo(
      * @param index the source index of the texture to override.
      * @param value the id of the texture to override with.
      */
+    @Deprecated(
+        message = "Deprecated. Use setObjRetex2(wearpos, index, value) for consistency.",
+        replaceWith = ReplaceWith("setObjRetex2(wearpos, index, value)"),
+    )
     public fun objRetex2(
+        wearpos: Int,
+        index: Int,
+        value: Int,
+    ) {
+        setObjRetex2(wearpos, index, value)
+    }
+
+    /**
+     * Retextures part of an obj in the second slot (out of two).
+     * @param wearpos the position in which the obj is worn.
+     * @param index the source index of the texture to override.
+     * @param value the id of the texture to override with.
+     */
+    public fun setObjRetex2(
         wearpos: Int,
         index: Int,
         value: Int,
@@ -1269,6 +1605,16 @@ public class PlayerAvatarExtendedInfo(
         blocks.spotAnims.clear()
         blocks.hit.clear()
         blocks.tinting.clear()
+        observedChatStorage.reset()
+    }
+
+    /**
+     * Resets the cached state on reconnect, ensuring we inform the client of all that was
+     * previously assigned.
+     */
+    internal fun onReconnect() {
+        this.lastAppearanceChangeCycle = 0
+        this.otherAppearanceChangeCycles.fill(-1)
     }
 
     /**
@@ -1405,6 +1751,18 @@ public class PlayerAvatarExtendedInfo(
         if (flag and APPEARANCE != 0) {
             observer.otherAppearanceChangeCycles[localIndex] = lastAppearanceChangeCycle
         }
+        // Note: The order must be as client expects it, in 222 say is before chat
+        if (flag and SAY != 0) {
+            val appendToChatbox =
+                this.blocks.say.text
+                    ?.get(0) == '~'
+            if (localIndex == observer.localIndex || appendToChatbox) {
+                observer.observedChatStorage.trackSay(this.localIndex, this.blocks.say)
+            }
+        }
+        if (flag and CHAT != 0) {
+            observer.observedChatStorage.trackChat(this.localIndex, this.blocks.chat)
+        }
         writer.pExtendedInfo(
             buffer,
             localIndex,
@@ -1449,7 +1807,7 @@ public class PlayerAvatarExtendedInfo(
      * Resets our tracked version of the target's appearance,
      * so it will be updated whenever someone else takes their index.
      */
-    public fun onOtherAvatarDeallocated(idx: Int) {
+    internal fun onOtherAvatarDeallocated(idx: Int) {
         otherAppearanceChangeCycles[idx] = -1
     }
 
@@ -1474,6 +1832,7 @@ public class PlayerAvatarExtendedInfo(
         private val UNSIGNED_BYTE_RANGE: IntRange = UByte.MIN_VALUE.toInt()..UByte.MAX_VALUE.toInt()
         private val UNSIGNED_SHORT_RANGE: IntRange = UShort.MIN_VALUE.toInt()..UShort.MAX_VALUE.toInt()
         private val UNSIGNED_SMART_1_OR_2_RANGE: IntRange = 0..0x7FFF
+        private val HIT_TYPE_RANGE: IntRange = -1..0x7FFD
 
         /**
          * Executes the [block] if input verification is enabled,

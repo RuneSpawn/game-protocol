@@ -2,12 +2,11 @@ package net.rsprot.protocol.game.outgoing.codec.zone.header
 
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.ByteBufAllocator
+import io.netty.util.ReferenceCountUtil
 import net.rsprot.buffer.JagByteBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
 import net.rsprot.crypto.cipher.StreamCipher
 import net.rsprot.protocol.ServerProt
-import net.rsprot.protocol.common.game.outgoing.codec.zone.payload.OldSchoolZoneProt
-import net.rsprot.protocol.common.game.outgoing.codec.zone.payload.ZoneProtEncoder
 import net.rsprot.protocol.game.outgoing.codec.zone.payload.LocAddChangeEncoder
 import net.rsprot.protocol.game.outgoing.codec.zone.payload.LocAnimEncoder
 import net.rsprot.protocol.game.outgoing.codec.zone.payload.LocDelEncoder
@@ -21,6 +20,8 @@ import net.rsprot.protocol.game.outgoing.codec.zone.payload.ObjEnabledOpsEncoder
 import net.rsprot.protocol.game.outgoing.codec.zone.payload.SoundAreaEncoder
 import net.rsprot.protocol.game.outgoing.prot.GameServerProt
 import net.rsprot.protocol.game.outgoing.zone.header.UpdateZonePartialEnclosed
+import net.rsprot.protocol.internal.game.outgoing.codec.zone.payload.OldSchoolZoneProt
+import net.rsprot.protocol.internal.game.outgoing.codec.zone.payload.ZoneProtEncoder
 import net.rsprot.protocol.message.ZoneProt
 import net.rsprot.protocol.message.codec.MessageEncoder
 import net.rsprot.protocol.message.codec.UpdateZonePartialEnclosedCache
@@ -37,11 +38,11 @@ public class DesktopUpdateZonePartialEnclosedEncoder : MessageEncoder<UpdateZone
         buffer.p1(message.zoneZ)
         buffer.p1Alt2(message.zoneX)
         buffer.p1Alt1(message.level)
-        buffer.buffer.writeBytes(
-            message.payload,
-            message.payload.readerIndex(),
-            message.payload.readableBytes(),
-        )
+        // buffer.buffer.writeBytes(
+        //     message.payload,
+        //     message.payload.readerIndex(),
+        //     message.payload.readableBytes(),
+        // )
     }
 
     public companion object : UpdateZonePartialEnclosedCache {
@@ -62,7 +63,7 @@ public class DesktopUpdateZonePartialEnclosedEncoder : MessageEncoder<UpdateZone
          */
         override fun <T : ZoneProt> buildCache(
             allocator: ByteBufAllocator,
-            messages: List<T>,
+            messages: Collection<T>,
         ): ByteBuf {
             val buffer =
                 allocator
@@ -70,14 +71,19 @@ public class DesktopUpdateZonePartialEnclosedEncoder : MessageEncoder<UpdateZone
                         min(IndexedZoneProtEncoder.maxZoneProtSize * messages.size, MAX_PARTIAL_ENCLOSED_SIZE),
                         MAX_PARTIAL_ENCLOSED_SIZE,
                     ).toJagByteBuf()
-            for (message in messages) {
-                val indexedEncoder = IndexedZoneProtEncoder.indexedEncoders[message.protId]
-                buffer.p1(indexedEncoder.ordinal)
-                encodeMessage(
-                    buffer,
-                    message,
-                    indexedEncoder.encoder,
-                )
+            try {
+                for (message in messages) {
+                    val indexedEncoder = IndexedZoneProtEncoder.indexedEncoders[message.protId]
+                    buffer.p1(indexedEncoder.ordinal)
+                    encodeMessage(
+                        buffer,
+                        message,
+                        indexedEncoder.encoder,
+                    )
+                }
+            } catch (t: Throwable) {
+                ReferenceCountUtil.safeRelease(buffer.buffer)
+                throw t
             }
             return buffer.buffer
         }
@@ -117,17 +123,50 @@ public class DesktopUpdateZonePartialEnclosedEncoder : MessageEncoder<UpdateZone
             private val protId: Int,
             val encoder: ZoneProtEncoder<*>,
         ) {
-            LOC_ADD_CHANGE(OldSchoolZoneProt.LOC_ADD_CHANGE, LocAddChangeEncoder()),
-            OBJ_ADD(OldSchoolZoneProt.OBJ_ADD, ObjAddEncoder()),
-            LOC_DEL(OldSchoolZoneProt.LOC_DEL, LocDelEncoder()),
-            SOUND_AREA(OldSchoolZoneProt.SOUND_AREA, SoundAreaEncoder()),
-            OBJ_ENABLED_OPS(OldSchoolZoneProt.OBJ_ENABLED_OPS, ObjEnabledOpsEncoder()),
-            MAP_ANIM(OldSchoolZoneProt.MAP_ANIM, MapAnimEncoder()),
-            LOC_MERGE(OldSchoolZoneProt.LOC_MERGE, LocMergeEncoder()),
-            MAP_PROJANIM(OldSchoolZoneProt.MAP_PROJANIM, MapProjAnimEncoder()),
-            OBJ_COUNT(OldSchoolZoneProt.OBJ_COUNT, ObjCountEncoder()),
-            OBJ_DEL(OldSchoolZoneProt.OBJ_DEL, ObjDelEncoder()),
-            LOC_ANIM(OldSchoolZoneProt.LOC_ANIM, LocAnimEncoder()),
+            LOC_ADD_CHANGE(
+                OldSchoolZoneProt.LOC_ADD_CHANGE,
+                LocAddChangeEncoder(),
+            ),
+            OBJ_ADD(
+                OldSchoolZoneProt.OBJ_ADD,
+                ObjAddEncoder(),
+            ),
+            LOC_DEL(
+                OldSchoolZoneProt.LOC_DEL,
+                LocDelEncoder(),
+            ),
+            SOUND_AREA(
+                OldSchoolZoneProt.SOUND_AREA,
+                SoundAreaEncoder(),
+            ),
+            OBJ_ENABLED_OPS(
+                OldSchoolZoneProt.OBJ_ENABLED_OPS,
+                ObjEnabledOpsEncoder(),
+            ),
+            MAP_ANIM(
+                OldSchoolZoneProt.MAP_ANIM,
+                MapAnimEncoder(),
+            ),
+            LOC_MERGE(
+                OldSchoolZoneProt.LOC_MERGE,
+                LocMergeEncoder(),
+            ),
+            MAP_PROJANIM(
+                OldSchoolZoneProt.MAP_PROJANIM,
+                MapProjAnimEncoder(),
+            ),
+            OBJ_COUNT(
+                OldSchoolZoneProt.OBJ_COUNT,
+                ObjCountEncoder(),
+            ),
+            OBJ_DEL(
+                OldSchoolZoneProt.OBJ_DEL,
+                ObjDelEncoder(),
+            ),
+            LOC_ANIM(
+                OldSchoolZoneProt.LOC_ANIM,
+                LocAnimEncoder(),
+            ),
             ;
 
             companion object {

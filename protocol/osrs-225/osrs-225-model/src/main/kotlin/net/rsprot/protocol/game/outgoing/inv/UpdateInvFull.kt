@@ -1,11 +1,11 @@
 package net.rsprot.protocol.game.outgoing.inv
 
 import net.rsprot.protocol.ServerProtCategory
-import net.rsprot.protocol.common.RSProtFlags
 import net.rsprot.protocol.common.game.outgoing.inv.InventoryObject
-import net.rsprot.protocol.common.game.outgoing.inv.internal.Inventory
-import net.rsprot.protocol.common.game.outgoing.inv.internal.InventoryPool
 import net.rsprot.protocol.game.outgoing.GameServerProtCategory
+import net.rsprot.protocol.internal.RSProtFlags
+import net.rsprot.protocol.internal.game.outgoing.inv.internal.Inventory
+import net.rsprot.protocol.internal.game.outgoing.inv.internal.InventoryPool
 import net.rsprot.protocol.message.OutgoingGameMessage
 import net.rsprot.protocol.util.CombinedId
 
@@ -94,6 +94,14 @@ public class UpdateInvFull private constructor(
     override val category: ServerProtCategory
         get() = GameServerProtCategory.HIGH_PRIORITY_PROT
 
+    override fun estimateSize(): Int {
+        // We always assume the obj counts are >= 255
+        return Int.SIZE_BYTES +
+            Short.SIZE_BYTES +
+            Short.SIZE_BYTES +
+            (capacity * 7)
+    }
+
     /**
      * Gets the bitpacked obj in the [slot] provided.
      * @param slot the slot in the inventory.
@@ -106,7 +114,8 @@ public class UpdateInvFull private constructor(
 
     public fun returnInventory() {
         inventory.clear()
-        InventoryPool.pool.returnObject(inventory)
+        InventoryPool.pool
+            .returnObject(inventory)
     }
 
     override fun equals(other: Any?): Boolean {
@@ -167,7 +176,9 @@ public class UpdateInvFull private constructor(
             capacity: Int,
             provider: ObjectProvider,
         ): Inventory {
-            val inventory = InventoryPool.pool.borrowObject()
+            val inventory =
+                InventoryPool.pool
+                    .borrowObject()
             for (i in 0..<capacity) {
                 val obj = provider.provide(i)
                 if (RSProtFlags.inventoryObjCheck) {

@@ -7,7 +7,6 @@ import net.rsprot.buffer.bitbuffer.UnsafeLongBackedBitBuf
 import net.rsprot.buffer.bitbuffer.toBitBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
 import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.ObserverExtendedInfoFlags
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
@@ -16,6 +15,7 @@ import net.rsprot.protocol.game.outgoing.info.playerinfo.util.CellOpcodes
 import net.rsprot.protocol.game.outgoing.info.util.Avatar
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
 import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.contract
 import kotlin.math.abs
@@ -51,6 +51,7 @@ public class PlayerInfo internal constructor(
     private var oldSchoolClientType: OldSchoolClientType,
     public val avatar: PlayerAvatar,
     private val recycler: ByteBufRecycler,
+    private val globalLowResolutionPositionRepository: GlobalLowResolutionPositionRepository,
 ) : ReferencePooledObject {
     /**
      * Low resolution indices are tracked together with [lowResolutionCount].
@@ -140,14 +141,6 @@ public class PlayerInfo internal constructor(
     private var highResMovementBuffer: UnsafeLongBackedBitBuf? = null
 
     /**
-     * Low resolution bit buffers are cached to avoid small computations for each observer,
-     * and it allows us to reduce the number of [BitBuf.pBits] calls, which are quite expensive.
-     * This implementation will store all the information inside a 'long' primitive, as the maximum
-     * data size will always fit in under 50 bits.
-     */
-    private var lowResMovementBuffer: UnsafeLongBackedBitBuf? = null
-
-    /**
      * The buffer into which all the information is written in this cycle.
      * It should be noted that this buffer is constantly changing, as we reallocate
      * a new buffer instance through the [allocator] each cycle. This is to ensure that
@@ -186,6 +179,7 @@ public class PlayerInfo internal constructor(
      * @param buildArea the build area to assign.
      */
     public fun updateBuildArea(buildArea: BuildArea) {
+        if (isDestroyed()) return
         this.buildArea = buildArea
     }
 
@@ -205,6 +199,7 @@ public class PlayerInfo internal constructor(
         widthInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
         heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
     ) {
+        if (isDestroyed()) return
         this.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
@@ -214,6 +209,7 @@ public class PlayerInfo internal constructor(
      * @return the newly created arraylist of indices
      */
     public fun getHighResolutionIndices(): ArrayList<Int> {
+        if (isDestroyed()) return ArrayList(0)
         val collection = ArrayList<Int>(highResolutionCount)
         for (i in 0..<highResolutionCount) {
             val index = highResolutionIndices[i].toInt()
@@ -229,6 +225,7 @@ public class PlayerInfo internal constructor(
      * @return the provided [collection] to chaining.
      */
     public fun <T> appendHighResolutionIndices(collection: T): T where T : MutableCollection<Int> {
+        if (isDestroyed()) return collection
         for (i in 0..<highResolutionCount) {
             val index = highResolutionIndices[i].toInt()
             collection.add(index)
@@ -270,6 +267,7 @@ public class PlayerInfo internal constructor(
         x: Int,
         z: Int,
     ) {
+        if (isDestroyed()) return
         this.avatar.updateCoord(level, x, z)
     }
 
@@ -342,6 +340,7 @@ public class PlayerInfo internal constructor(
      * @param byteBuf the buffer into which the information will be written.
      */
     public fun handleAbsolutePlayerPositions(byteBuf: ByteBuf) {
+        if (isDestroyed()) return
         check(avatar.currentCoord != CoordGrid.INVALID) {
             "Avatar position must be updated via playerinfo#updateCoord before sending RebuildLogin/ReconnectOk."
         }
@@ -369,9 +368,9 @@ public class PlayerInfo internal constructor(
      * Cached state should be re-assigned from the server as a result of this.
      */
     public fun onReconnect() {
+        if (isDestroyed()) return
         this.buffer = null
         highResMovementBuffer = null
-        lowResMovementBuffer = null
 
         lowResolutionIndices.fill(0)
         lowResolutionCount = 0
@@ -384,15 +383,43 @@ public class PlayerInfo internal constructor(
         stationary.fill(0)
         observerExtendedInfoFlags.reset()
         avatar.postUpdate()
+        avatar.extendedInfo.onReconnect()
     }
 
     /**
-     * Precalculates all the bitcodes for this player, for both low-resolution and high-resolution updates.
+     * Ensures that the state has been correctly reset and a reconnect packet can continue.
+     * @throws IllegalStateException if the state has not fully been cleaned up.
+     */
+    internal fun ensureReconnectCalled() {
+        if (!isCleanState()) {
+            throw IllegalStateException(
+                "In order to use LoginResponse.ReconnectOk packet, " +
+                    "playerinfo#onReconnect, npcInfo#onReconnect " +
+                    "and worldEntityInfo#onReconnect must be called!",
+            )
+        }
+    }
+
+    /**
+     * Checks whether all the info has been reset for this packet, ensuring that
+     * a reconnect packet can successfully be initialized.
+     * @return whether all the state has been reset.
+     */
+    private fun isCleanState(): Boolean =
+        buffer == null &&
+            highResMovementBuffer == null &&
+            lowResolutionCount == 0 &&
+            highResolutionCount == 0 &&
+            extendedInfoCount == 0
+
+    /**
+     * Precalculates all the bitcodes for this player, for high-resolution updates.
      * This function will be thread-safe relative to other players and can be calculated concurrently for all players.
      */
-    internal fun prepareBitcodes(globalLowResolutionPositionRepository: GlobalLowResolutionPositionRepository) {
+    internal fun prepareBitcodes() {
+        this.avatar.extendedInfo.observedChatStorage
+            .reset()
         this.highResMovementBuffer = prepareHighResMovement()
-        this.lowResMovementBuffer = prepareLowResMovement(globalLowResolutionPositionRepository)
     }
 
     /**
@@ -419,7 +446,17 @@ public class PlayerInfo internal constructor(
         val jagBuffer = backingBuffer().toJagByteBuf()
         for (i in 0 until extendedInfoCount) {
             val index = extendedInfoIndices[i].toInt()
-            val other = checkNotNull(protocol.getPlayerInfo(index))
+            val other = protocol.getPlayerInfo(index)
+            // If other is null at this point, it means it was destroyed mid-processing at an earlier
+            // stage. In order to avoid the issue escalating further by throwing errors for every player
+            // that was in vicinity of the player that got destroyed, we simply write no-mask-update,
+            // even though a mask update was requested at an earlier stage.
+            // The next game tick, the player will be removed as the info is null, which is one of
+            // the conditions for removing another player from tracking.
+            if (other == null) {
+                jagBuffer.p1(0)
+                continue
+            }
             val observerFlag = observerExtendedInfoFlags.getFlag(index)
             val tracked =
                 other.avatar.extendedInfo.pExtendedInfo(
@@ -467,13 +504,23 @@ public class PlayerInfo internal constructor(
                 continue
             }
             val other = protocol.getPlayerInfo(index)
+            val lowResolutionBuffer = globalLowResolutionPositionRepository.getBuffer(index)
             if (other == null) {
+                if (lowResolutionBuffer != null) {
+                    if (skips > -1) {
+                        pStationary(buffer, skips)
+                        skips = -1
+                    }
+                    buffer.pBits(1, 1)
+                    buffer.pBits(lowResolutionBuffer)
+                    continue
+                }
                 skips++
                 stationary[index] = (stationary[index].toInt() or IS_STATIONARY).toByte()
                 continue
             }
             val visible = shouldMoveToHighResolution(other)
-            if (!visible && other.lowResMovementBuffer == null) {
+            if (!visible && lowResolutionBuffer == null) {
                 skips++
                 stationary[index] = (stationary[index].toInt() or IS_STATIONARY).toByte()
                 continue
@@ -484,7 +531,7 @@ public class PlayerInfo internal constructor(
             }
             if (!visible) {
                 buffer.pBits(1, 1)
-                buffer.pBits(other.lowResMovementBuffer!!)
+                buffer.pBits(lowResolutionBuffer!!)
                 continue
             }
             pLowResToHighRes(buffer, other)
@@ -508,7 +555,7 @@ public class PlayerInfo internal constructor(
         // buffer.pBits(1, 1)
         // buffer.pBits(2, 0)
         buffer.pBits(3, 1 shl 2)
-        val lowResBuf = other.lowResMovementBuffer
+        val lowResBuf = globalLowResolutionPositionRepository.getBuffer(index)
         if (lowResBuf != null) {
             buffer.pBits(1, 1)
             buffer.pBits(lowResBuf)
@@ -564,7 +611,7 @@ public class PlayerInfo internal constructor(
                     pStationary(buffer, skips)
                     skips = -1
                 }
-                pHighToLowResChange(buffer, index, other)
+                pHighToLowResChange(buffer, index)
                 continue
             }
 
@@ -678,7 +725,6 @@ public class PlayerInfo internal constructor(
     private fun pHighToLowResChange(
         buffer: BitBuf,
         index: Int,
-        other: PlayerInfo?,
     ) {
         unsetHighResolution(index)
         unsetHighResolutionExtendedInfoTracked(index)
@@ -687,7 +733,7 @@ public class PlayerInfo internal constructor(
         // buffer.pBits(1, 0)
         // buffer.pBits(2, 0)
         buffer.pBits(4, 1 shl 3)
-        val buf = other?.lowResMovementBuffer
+        val buf = globalLowResolutionPositionRepository.getBuffer(index)
         if (buf != null) {
             buffer.pBits(1, 1)
             buffer.pBits(buf)
@@ -729,10 +775,8 @@ public class PlayerInfo internal constructor(
         if (!coord.inDistance(this.avatar.currentCoord, this.avatar.resizeRange)) {
             return false
         }
-        if (coord !in buildArea) {
-            return false
-        }
-        return true
+        val buildArea = this.buildArea
+        return buildArea == BuildArea.INVALID || coord in buildArea
     }
 
     /**
@@ -758,10 +802,8 @@ public class PlayerInfo internal constructor(
         if (!coord.inDistance(this.avatar.currentCoord, this.avatar.resizeRange)) {
             return false
         }
-        if (coord !in buildArea) {
-            return false
-        }
-        return true
+        val buildArea = this.buildArea
+        return buildArea == BuildArea.INVALID || coord in buildArea
     }
 
     /**
@@ -838,43 +880,6 @@ public class PlayerInfo internal constructor(
         this.buffer = null
         avatar.extendedInfo.reset()
         highResMovementBuffer = null
-        lowResMovementBuffer = null
-    }
-
-    /**
-     * Prepares the low resolution movement block using global information about all players'
-     * low resolution coordinates.
-     * @param globalLowResolutionPositionRepository the global repository tracking everyone's
-     * low resolution coordinate.
-     * @return unsafe long-backed bit buffer that encodes the information into a 'long' primitive,
-     * rather than a real byte buffer, in order to reduce unnecessary computations.
-     */
-    private fun prepareLowResMovement(
-        globalLowResolutionPositionRepository: GlobalLowResolutionPositionRepository,
-    ): UnsafeLongBackedBitBuf? {
-        val old = globalLowResolutionPositionRepository.getPreviousLowResolutionPosition(localIndex)
-        val cur = globalLowResolutionPositionRepository.getCurrentLowResolutionPosition(localIndex)
-        if (old == cur) {
-            return null
-        }
-        val buffer = UnsafeLongBackedBitBuf()
-        val deltaX = cur.x - old.x
-        val deltaZ = cur.z - old.z
-        val deltaLevel = cur.level - old.level
-        if (deltaX == 0 && deltaZ == 0) {
-            buffer.pBits(2, 1)
-            buffer.pBits(2, deltaLevel)
-        } else if (abs(deltaX) <= 1 && abs(deltaZ) <= 1) {
-            buffer.pBits(2, 2)
-            buffer.pBits(2, deltaLevel)
-            buffer.pBits(3, CellOpcodes.singleCellMovementOpcode(deltaX, deltaZ))
-        } else {
-            buffer.pBits(2, 3)
-            buffer.pBits(2, deltaLevel)
-            buffer.pBits(8, deltaX and 0xFF)
-            buffer.pBits(8, deltaZ and 0xFF)
-        }
-        return buffer
     }
 
     /**

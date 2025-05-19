@@ -2,8 +2,8 @@ package net.rsprot.protocol.game.outgoing.info.npcinfo
 
 import io.netty.buffer.ByteBufAllocator
 import net.rsprot.compression.provider.HuffmanCodecProvider
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.filter.ExtendedInfoFilter
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 
 /**
  * NPC avatar factor is responsible for allocating new avatars for NPCs,
@@ -67,6 +67,7 @@ public class NpcAvatarFactory(
      * @param direction the direction that the npc will face on spawn (see table above)
      * @return a npc avatar with the above provided details.
      */
+    @JvmOverloads
     public fun alloc(
         index: Int,
         id: Int,
@@ -75,8 +76,26 @@ public class NpcAvatarFactory(
         z: Int,
         spawnCycle: Int = 0,
         direction: Int = 0,
-    ): NpcAvatar =
-        avatarRepository.getOrAlloc(
+    ): NpcAvatar {
+        require(index in 0..65534) {
+            "Npc avatar index out of bounds: $index"
+        }
+        require(id in 0..16383) {
+            "Npc id cannot be outside of 0..16383 range"
+        }
+        require(level in 0..3) {
+            "Level cannot be outside of 0..3 range"
+        }
+        require(x in 0..16383) {
+            "X coordinate cannot be outside of 0..16383 range"
+        }
+        require(z in 0..16383) {
+            "Z coordinate cannot be outside of 0..16383 range"
+        }
+        require(direction in 0..7) {
+            "Direction must be in range of 0..7"
+        }
+        return avatarRepository.getOrAlloc(
             index,
             id,
             level,
@@ -85,6 +104,7 @@ public class NpcAvatarFactory(
             spawnCycle,
             direction,
         )
+    }
 
     /**
      * Releases the avatar back into the repository to be used by other NPCs.

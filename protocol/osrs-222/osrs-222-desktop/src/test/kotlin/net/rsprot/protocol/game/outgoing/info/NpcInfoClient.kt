@@ -5,7 +5,7 @@ import net.rsprot.buffer.JagByteBuf
 import net.rsprot.buffer.bitbuffer.BitBuf
 import net.rsprot.buffer.bitbuffer.toBitBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
 
 @Suppress("MemberVisibilityCanBePrivate")
 class NpcInfoClient {
@@ -26,19 +26,23 @@ class NpcInfoClient {
     ) {
         deletedNpcCount = 0
         updatedNpcSlotCount = 0
-        buffer.toBitBuf().use { bitBuffer ->
-            processHighResolution(bitBuffer)
-            processLowResolution(large, bitBuffer, localPlayerCoord)
-        }
-        processExtendedInfo(buffer.toJagByteBuf())
-        for (i in 0..<deletedNpcCount) {
-            val index = deletedNpcSlot[i]
-            if (cycle != checkNotNull(cachedNpcs[index]).lastUpdateCycle) {
-                cachedNpcs[index] = null
+        try {
+            buffer.toBitBuf().use { bitBuffer ->
+                processHighResolution(bitBuffer)
+                processLowResolution(large, bitBuffer, localPlayerCoord)
             }
-        }
-        if (buffer.isReadable) {
-            throw IllegalStateException("npc info buffer still readable: ${buffer.readableBytes()}")
+            processExtendedInfo(buffer.toJagByteBuf())
+            for (i in 0..<deletedNpcCount) {
+                val index = deletedNpcSlot[i]
+                if (cycle != checkNotNull(cachedNpcs[index]).lastUpdateCycle) {
+                    cachedNpcs[index] = null
+                }
+            }
+            if (buffer.isReadable) {
+                throw IllegalStateException("npc info buffer still readable: ${buffer.readableBytes()}")
+            }
+        } finally {
+            buffer.release()
         }
         for (i in 0..<npcSlotCount) {
             if (cachedNpcs[npcSlot[i]] == null) {
@@ -291,7 +295,7 @@ class NpcInfoClient {
     }
 
     enum class MoveSpeed(
-        val id: Int,
+        @Suppress("unused") val id: Int,
     ) {
         STATIONARY(-1),
         CRAWL(0),

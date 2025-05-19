@@ -1,20 +1,24 @@
+@file:Suppress("DuplicatedCode")
+
 package net.rsprot.protocol.game.outgoing.info.npcinfo
 
+import com.github.michaelbull.logging.InlineLogger
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.ByteBufAllocator
 import net.rsprot.buffer.bitbuffer.BitBuf
 import net.rsprot.buffer.bitbuffer.toBitBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
-import net.rsprot.protocol.common.checkCommunicationThread
-import net.rsprot.protocol.common.client.ClientTypeMap
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
+import net.rsprot.protocol.internal.checkCommunicationThread
+import net.rsprot.protocol.internal.client.ClientTypeMap
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.npcinfo.encoder.NpcResolutionChangeEncoder
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
+import net.rsprot.protocol.message.ConsumableMessage
 import net.rsprot.protocol.message.OutgoingGameMessage
 import kotlin.contracts.ExperimentalContracts
 import kotlin.contracts.contract
@@ -34,6 +38,7 @@ import kotlin.contracts.contract
  * @property lowResolutionToHighResolutionEncoders a client map of low resolution to high resolution
  * change encoders, used to move a npc into high resolution for the given player.
  * As this is scrambled, a separate client-specific implementation is required.
+ * @property filter a npc avatar filter that must be passed to add/keep a npc in high resolution.
  */
 @OptIn(ExperimentalUnsignedTypes::class)
 @Suppress("ReplaceUntilWithRangeUntil")
@@ -46,6 +51,7 @@ public class NpcInfo internal constructor(
     private val lowResolutionToHighResolutionEncoders: ClientTypeMap<NpcResolutionChangeEncoder>,
     private val detailsStorage: NpcInfoWorldDetailsStorage,
     private val recycler: ByteBufRecycler,
+    private val filter: NpcAvatarFilter?,
 ) : ReferencePooledObject {
     /**
      * The maximum view distance how far a player will see other NPCs.
@@ -57,7 +63,7 @@ public class NpcInfo internal constructor(
 
     /**
      * The exception that was caught during the processing of this player's npc info packet.
-     * This exception will be propagated further during the [toNpcInfoPacket] function call,
+     * This exception will be propagated further during the [toPacket] function call,
      * allowing the server to handle it properly at a per-player basis.
      */
     @Volatile
@@ -68,6 +74,13 @@ public class NpcInfo internal constructor(
      * The root world is placed at the end of this array, however id -1 will be treated as the root.
      */
     internal val details: Array<NpcInfoWorldDetails?> = arrayOfNulls(WORLD_ENTITY_CAPACITY + 1)
+
+    /**
+     * An array of NPCs which are marked as specific-visible. Any NPC avatar that was explicitly marked
+     * as visible-to-specific-only will only render to players that mark that avatar's index as specific
+     * visible. Anyone else will be unable to see such NPCs.
+     */
+    internal val specificVisible: LongArray = LongArray((NPC_INFO_CAPACITY + 1) ushr 6)
 
     override fun isDestroyed(): Boolean = this.exception != null
 
@@ -84,6 +97,7 @@ public class NpcInfo internal constructor(
         buildArea: BuildArea,
     ) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         require(worldId == ROOT_WORLD || worldId in 0..<2048) {
             "World id must be -1 or in range of 0..<2048"
         }
@@ -111,6 +125,7 @@ public class NpcInfo internal constructor(
         heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
     ) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         require(worldId == ROOT_WORLD || worldId in 0..<2048) {
             "World id must be -1 or in range of 0..<2048"
         }
@@ -125,6 +140,7 @@ public class NpcInfo internal constructor(
      */
     public fun allocateWorld(worldId: Int) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         require(worldId in 0..<WORLD_ENTITY_CAPACITY) {
             "World id out of bounds: $worldId"
         }
@@ -141,6 +157,7 @@ public class NpcInfo internal constructor(
      */
     public fun destroyWorld(worldId: Int) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         require(worldId in 0..<WORLD_ENTITY_CAPACITY) {
             "World id out of bounds: $worldId"
         }
@@ -148,6 +165,7 @@ public class NpcInfo internal constructor(
         require(existing != null) {
             "World $worldId does not exist."
         }
+        releaseObservers(existing)
         detailsStorage.push(existing)
         details[worldId] = null
     }
@@ -200,6 +218,7 @@ public class NpcInfo internal constructor(
      */
     public fun getHighResolutionIndices(worldId: Int): ArrayList<Int> {
         checkCommunicationThread()
+        if (isDestroyed()) return ArrayList(0)
         val details = getDetails(worldId)
         val collection = ArrayList<Int>(details.highResolutionNpcIndexCount)
         for (i in 0..<details.highResolutionNpcIndexCount) {
@@ -222,6 +241,7 @@ public class NpcInfo internal constructor(
      */
     public fun getHighResolutionIndicesOrNull(worldId: Int): ArrayList<Int>? {
         checkCommunicationThread()
+        if (isDestroyed()) return null
         val details = getDetailsOrNull(worldId) ?: return null
         val collection = ArrayList<Int>(details.highResolutionNpcIndexCount)
         for (i in 0..<details.highResolutionNpcIndexCount) {
@@ -254,6 +274,7 @@ public class NpcInfo internal constructor(
         throwExceptionIfNoWorld: Boolean = true,
     ): T where T : MutableCollection<Int> {
         checkCommunicationThread()
+        if (isDestroyed()) return collection
         val details =
             if (throwExceptionIfNoWorld) {
                 getDetails(worldId)
@@ -273,7 +294,7 @@ public class NpcInfo internal constructor(
      * initialized for this cycle.
      */
     @Throws(IllegalStateException::class)
-    public fun backingBuffer(worldId: Int): ByteBuf = checkNotNull(getDetails(worldId).buffer)
+    private fun backingBuffer(worldId: Int): ByteBuf = checkNotNull(getDetails(worldId).buffer)
 
     /**
      * Returns the backing byte buffer holding all the computed information.
@@ -289,6 +310,7 @@ public class NpcInfo internal constructor(
      */
     public fun setViewDistance(num: Int) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.viewDistance = num
     }
 
@@ -297,14 +319,187 @@ public class NpcInfo internal constructor(
      */
     public fun resetViewDistance() {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.viewDistance = MAX_SMALL_PACKET_DISTANCE
+    }
+
+    /**
+     * Sets the priority threshold caps for how many NPCs can render at once in
+     * either of the priority groups.
+     *
+     * It is important to note that if the priority caps are modified at "runtime" (as in, once NPCs
+     * are already being tracked), any existing NPCs which are being tracked will not be cleared out
+     * by calling this function. It will only prevent new additions from taking place beyond the new
+     * limits, but one would have to wait until the counts naturally decrement down in order to hit
+     * the desired limits.
+     *
+     * The intended use-case here is to deprioritize dynamic NPCs such as pets which could fill up
+     * the entire high resolution with just pets, preventing more important NPCs, such as shopkeepers
+     * from rendering to the player. By restricting low priority to say 150 NPCs, and normal priority
+     * to 100, as long as we correctly flag the pet NPCs as low priority, we ensure that no more than
+     * 150 pets can ever render at once, leaving those 100 remaining slots for any NPCs that are deemed
+     * more important.
+     *
+     * Due to the structure of the NPC info protocol, it is not viable to do an implementation where
+     * the high resolution is consistently capped out (e.g. allow up to 250 pets, but if more important
+     * NPCs come into range, drop some pets and render the higher resolution NPCs instead). This would
+     * be computationally heavy to check as the protocol first goes over any existing high resolution
+     * NPCs, which means we lack any context over how many higher resolution NPCs in need of rendering.
+     * Even if we allow the one tick delay to occur here, the implementation would be quite tricky and
+     * is not worth the headache it causes.
+     *
+     * @param worldId the world id to set the caps for.
+     * @param lowPriorityCap the maximum number of NPCs that can render at once with the low priority.
+     * If the low priority cap has been reached, no more NPCs with the low priority will be able to be
+     * added to high resolution.
+     * @param normalPrioritySoftCap the maximum number of normal priority NPCs that can render at once.
+     * Note that if the normal priority cap is reached, the low priority group will be utilized instead.
+     * In such cases, it is possible to end up with more normal priority NPCs than what is indicated by
+     * the soft cap.
+     */
+    public fun setPriorityCaps(
+        worldId: Int,
+        lowPriorityCap: Int,
+        normalPrioritySoftCap: Int,
+    ) {
+        if (isDestroyed()) return
+        require(lowPriorityCap >= 0) {
+            "Low priority cap cannot be negative."
+        }
+        require(normalPrioritySoftCap >= 0) {
+            "Normal priority soft cap cannot be negative."
+        }
+        require(lowPriorityCap + normalPrioritySoftCap <= MAX_HIGH_RESOLUTION_NPCS) {
+            "The sum of low priority cap and normal priority soft cap must be $MAX_HIGH_RESOLUTION_NPCS or fewer."
+        }
+        val world = getDetails(worldId)
+        world.lowPriorityCap = lowPriorityCap
+        world.normalPrioritySoftCap = normalPrioritySoftCap
+    }
+
+    /**
+     * Marks the specified NPC's [avatar] as specific-visible, meaning the NPC will render
+     * to this player if other conditions are met. Anyone that hasn't marked it as specific
+     * will be unable to see that NPC.
+     * @param avatar the NPC avatar whom to mark as specific-visible.
+     * @throws IllegalArgumentException if the [avatar] was not allocated as specific-only.
+     */
+    public fun setSpecific(avatar: NpcAvatar) {
+        if (isDestroyed()) return
+        require(avatar.details.specific) {
+            "Only avatars that are marked as specific-only can be marked as specific."
+        }
+        setSpecific(avatar.details.index)
+    }
+
+    /**
+     * Clears the specified NPC's [avatar] as specific-visible.
+     * @param avatar the NPC avatar whom to unmark as specific-visible.
+     * @throws IllegalArgumentException if the [avatar] was not allocated as specific-only.
+     */
+    public fun clearSpecific(avatar: NpcAvatar) {
+        if (isDestroyed()) return
+        require(avatar.details.specific) {
+            "Only avatars that are marked as specific-only can be unmarked as specific."
+        }
+        unsetSpecific(avatar.details.index)
+    }
+
+    /**
+     * Checks whether the [avatar] is specific-visible.
+     * @param avatar the avatar of the NPC whom to check.
+     * @return whether the NPC has been marked as specific-visible.
+     */
+    public fun isSpecific(avatar: NpcAvatar): Boolean {
+        if (isDestroyed()) return false
+        return isSpecific(avatar.details.index)
+    }
+
+    /**
+     * Gets a new instance of an ArrayList containing the indices of all the NPCs that are
+     * still marked as specific to us. Note that any NPC which was originally marked as
+     * specific, but got deallocated at some point will not be part of this collection,
+     * as deallocated NPCs automatically unset as specific on all relevant players.
+     *
+     * This function is best used before a player logs out, to clear any associated specific
+     * NPCs. The returned collection is a new mutable ArrayList - servers are free to
+     * utilize or mutate this however they want, should they wish to do so. Note that
+     * this function needs to be called before deallocating NPC info.
+     *
+     * @return an ArrayList of NPC indices that are marked as specific and have not yet
+     * been deallocated from the game. These NPCs may still be in the inaccessible AKA dead state.
+     */
+    public fun getSpecificIndices(): ArrayList<Int> {
+        if (isDestroyed()) return ArrayList(0)
+        val list = ArrayList<Int>(0)
+        val array = this.specificVisible
+        for (i in array.indices) {
+            val vis = array[i]
+            // Quickly skip over 64 NPCs if there are no specifics
+            if (vis == 0L) continue
+            // Otherwise, do a regular length-64 iteration
+            // While this could be improved with more complicated nextSetBit() computations,
+            // given the nature of this function and how rarely specific NPCs are actually used,
+            // it is not worth the hassle.
+            val start = i * Long.SIZE_BITS
+            val end = start + Long.SIZE_BITS
+            for (index in start..<end) {
+                if (isSpecific(index)) {
+                    list.add(index)
+                }
+            }
+        }
+        return list
+    }
+
+    /**
+     * Checks whether the NPC at the specified [index] is specific-visible.
+     * @param index the absolute index of the NPC to check.
+     * @return whether the NPC has been marked as specific-visible.
+     */
+    private fun isSpecific(index: Int): Boolean {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        return this.specificVisible[longIndex] and bit != 0L
+    }
+
+    /**
+     * Sets the NPC at index [index] as specific-visible.
+     * @param index the absolute index of the NPC to set as specific.
+     */
+    private fun setSpecific(index: Int) {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        val cur = this.specificVisible[longIndex]
+        this.specificVisible[longIndex] = cur or bit
+    }
+
+    /**
+     * Clears the specific [index] flag from the specific visible NPCs bit array.
+     * @param index the absolute index of the NPC to clear.
+     */
+    internal fun unsetSpecific(index: Int) {
+        val longIndex = index ushr 6
+        val bit = 1L shl (index and 0x3F)
+        val cur = this.specificVisible[longIndex]
+        this.specificVisible[longIndex] = cur and bit.inv()
     }
 
     /**
      * Turns this npc info structure into a respective npc info packet, depending
      * on the current known view distance.
      */
-    public fun toNpcInfoPacket(worldId: Int): OutgoingGameMessage {
+    @Deprecated(
+        message = "Deprecated. Prefer toPacket(worldId) function instead for consistency.",
+        replaceWith = ReplaceWith("toPacket(worldId)"),
+    )
+    public fun toNpcInfoPacket(worldId: Int): OutgoingGameMessage = toPacket(worldId)
+
+    /**
+     * Turns this npc info structure into a respective npc info packet, depending
+     * on the current known view distance.
+     */
+    public fun toPacket(worldId: Int): OutgoingGameMessage {
         val exception = this.exception
         if (exception != null) {
             throw InfoProcessException(
@@ -312,10 +507,9 @@ public class NpcInfo internal constructor(
                 exception,
             )
         }
-        return if (this.viewDistance > MAX_SMALL_PACKET_DISTANCE) {
-            NpcInfoLarge(backingBuffer(worldId))
-        } else {
-            NpcInfoSmall(backingBuffer(worldId))
+        val details = getDetails(worldId)
+        return checkNotNull(details.previousPacket) {
+            "Previous packet has not been calculated."
         }
     }
 
@@ -348,6 +542,7 @@ public class NpcInfo internal constructor(
         z: Int,
     ) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         val details = getDetails(worldId)
         details.localPlayerCurrentCoord =
             CoordGrid(
@@ -395,6 +590,22 @@ public class NpcInfo internal constructor(
             details.localPlayerLastCoord = details.localPlayerCurrentCoord
             details.extendedInfoCount = 0
             details.observerExtendedInfoFlags.reset()
+
+            val previousPacket = details.previousPacket
+            if (previousPacket is ConsumableMessage) {
+                if (!previousPacket.isConsumed()) {
+                    logger.warn {
+                        "Previous npc info packet was calculated but " +
+                            "not sent out to the client for world ${details.worldId} for player $localPlayerIndex!"
+                    }
+                }
+            }
+            details.previousPacket =
+                if (this.viewDistance > MAX_SMALL_PACKET_DISTANCE) {
+                    NpcInfoLarge(backingBuffer(details.worldId))
+                } else {
+                    NpcInfoSmall(backingBuffer(details.worldId))
+                }
         }
     }
 
@@ -406,8 +617,18 @@ public class NpcInfo internal constructor(
         val jagBuffer = backingBuffer(details).toJagByteBuf()
         for (i in 0 until details.extendedInfoCount) {
             val index = details.extendedInfoIndices[i].toInt()
-            val other = checkNotNull(repository.getOrNull(index))
-            val observerFlag = details.observerExtendedInfoFlags.getFlag(i) and 0xFF
+            val other = repository.getOrNull(index)
+            if (other == null) {
+                // If other is null at this point, it means it was destroyed mid-processing at an earlier
+                // stage. In order to avoid the issue escalating further by throwing errors for every player
+                // that was in vicinity of the NPC that got destroyed, we simply write no-mask-update,
+                // even though a mask update was requested at an earlier stage.
+                // The next game tick, the NPC will be removed as the info is null, which is one of
+                // the conditions for removing a NPC from tracking.
+                jagBuffer.p1(0)
+                continue
+            }
+            val observerFlag = details.observerExtendedInfoFlags.getFlag(i)
             other.extendedInfo.pExtendedInfo(
                 oldSchoolClientType,
                 jagBuffer,
@@ -455,9 +676,10 @@ public class NpcInfo internal constructor(
             for (i in 0..<details.highResolutionNpcIndexCount) {
                 val npcIndex = details.highResolutionNpcIndices[i].toInt()
                 val avatar = repository.getOrNull(npcIndex) ?: continue
-                avatar.removeObserver()
+                avatar.removeObserver(localPlayerIndex)
             }
             details.highResolutionNpcIndexCount = 0
+            details.clearPriorities()
             return false
         }
         // Iterate NPCs in a backwards order until the first npc who should not be removed
@@ -469,8 +691,9 @@ public class NpcInfo internal constructor(
             if (!removeHighResolutionNpc(details, avatar, viewDistance)) {
                 break
             }
-            avatar?.removeObserver()
             details.highResolutionNpcIndexCount--
+            avatar?.removeObserver(localPlayerIndex)
+            details.decrementPriority(i)
         }
         val processedCount = details.highResolutionNpcIndexCount
         buffer.pBits(8, processedCount)
@@ -480,9 +703,10 @@ public class NpcInfo internal constructor(
             if (removeHighResolutionNpc(details, avatar, viewDistance)) {
                 buffer.pBits(1, 1)
                 buffer.pBits(2, 3)
-                avatar?.removeObserver()
                 details.highResolutionNpcIndices[i] = NPC_INDEX_TERMINATOR
                 details.highResolutionNpcIndexCount--
+                avatar?.removeObserver(localPlayerIndex)
+                details.decrementPriority(i)
                 continue
             }
             if (avatar.extendedInfo.flags != 0) {
@@ -520,11 +744,22 @@ public class NpcInfo internal constructor(
         ) {
             return true
         }
+        if (avatar.details.specific) {
+            if (!isSpecific(avatar.details.index)) {
+                return true
+            }
+        }
         val coord = avatar.details.currentCoord
         if (!withinDistance(details.localPlayerCurrentCoord, coord, viewDistance)) {
             return true
         }
-        return coord !in details.buildArea
+        val buildArea = details.buildArea
+        if (buildArea != BuildArea.INVALID && coord !in buildArea) {
+            return true
+        }
+        val filter = this.filter
+        return filter != null &&
+            !filter.accept(localPlayerIndex, avatar.details.index)
     }
 
     /**
@@ -536,7 +771,10 @@ public class NpcInfo internal constructor(
     private fun isInBuildArea(
         details: NpcInfoWorldDetails,
         avatar: NpcAvatar,
-    ): Boolean = avatar.details.currentCoord in details.buildArea
+    ): Boolean {
+        val buildArea = details.buildArea
+        return buildArea == BuildArea.INVALID || avatar.details.currentCoord in buildArea
+    }
 
     /**
      * Checks if the player has moved a greater distance from their previous coordinate
@@ -572,8 +810,12 @@ public class NpcInfo internal constructor(
         buffer: BitBuf,
         viewDistance: Int,
     ) {
+        val lowCap = details.lowPriorityCap
+        val normalSoftCap = details.normalPrioritySoftCap
         // If our local view is already maxed out, don't even bother calculating the below
-        if (details.highResolutionNpcIndexCount >= MAX_HIGH_RESOLUTION_NPCS) {
+        if (details.normalPriorityCount >= normalSoftCap &&
+            details.lowPriorityCount >= lowCap
+        ) {
             return
         }
         val encoder = lowResolutionToHighResolutionEncoders[oldSchoolClientType]
@@ -586,7 +828,8 @@ public class NpcInfo internal constructor(
         val startZ = ((centerZ - viewDistance) shr 3).coerceAtLeast(0)
         val endX = ((centerX + viewDistance) shr 3).coerceAtMost(0x7FF)
         val endZ = ((centerZ + viewDistance) shr 3).coerceAtMost(0x7FF)
-        for (x in startX..endX) {
+        val filter = this.filter
+        loop@for (x in startX..endX) {
             for (z in startZ..endZ) {
                 val npcs = this.zoneIndexStorage.get(level, x, z) ?: continue
                 for (k in 0..<npcs.size) {
@@ -597,12 +840,22 @@ public class NpcInfo internal constructor(
                     if (isHighResolution(details, index)) {
                         continue
                     }
-                    if (details.highResolutionNpcIndexCount >= MAX_HIGH_RESOLUTION_NPCS) {
-                        break
-                    }
                     val avatar = repository.getOrNull(index) ?: continue
                     if (avatar.details.inaccessible) {
                         continue
+                    }
+                    if (avatar.details.priorityBitcode and AVATAR_NORMAL_PRIORITY_FLAG != 0) {
+                        // For normal priority, once both our groups are capped out, we just break out of the loop,
+                        // as neither low nor normal priority NPCs can be added now.
+                        if (details.normalPriorityCount >= normalSoftCap && details.lowPriorityCount >= lowCap) {
+                            break@loop
+                        }
+                    } else {
+                        // For low priority, if we've reached our cap, just move on - there might be normal
+                        // priority NPCs still coming.
+                        if (details.lowPriorityCount >= lowCap) {
+                            continue
+                        }
                     }
                     if (!coord.inDistance(
                             avatar.details.currentCoord,
@@ -614,8 +867,20 @@ public class NpcInfo internal constructor(
                     if (!isInBuildArea(details, avatar)) {
                         continue
                     }
-                    avatar.addObserver()
+                    if (avatar.details.specific) {
+                        if (!isSpecific(index)) {
+                            continue
+                        }
+                    }
+                    if (filter != null && !filter.accept(localPlayerIndex, index)) {
+                        continue
+                    }
+                    avatar.addObserver(localPlayerIndex)
                     val i = details.highResolutionNpcIndexCount++
+                    details.incrementPriority(
+                        i,
+                        avatar.details.priorityBitcode and AVATAR_NORMAL_PRIORITY_FLAG == 0,
+                    )
                     details.highResolutionNpcIndices[i] = index.toUShort()
                     val observerFlags = avatar.extendedInfo.getLowToHighResChangeExtendedInfoFlags()
                     if (observerFlags != 0) {
@@ -680,6 +945,7 @@ public class NpcInfo internal constructor(
      */
     public fun onReconnect() {
         checkCommunicationThread()
+        if (isDestroyed()) return
         onDealloc()
         // Restore the root world by polling a new one
         val details = detailsStorage.poll(ROOT_WORLD)
@@ -709,11 +975,36 @@ public class NpcInfo internal constructor(
         }
     }
 
+    /**
+     * Clears all the entities for the provided [worldId]. This function is __only__ intended to be used
+     * together with the [net.rsprot.protocol.game.outgoing.worldentity.ClearEntities] packet.
+     * This packet should only be called before [NpcInfoProtocol.update] has been called, otherwise
+     * problems may arise.
+     * @param worldId the world to clear, either [ROOT_WORLD] or a value from 0..<2048
+     * If the world is [ROOT_WORLD], all worlds will be cleared.
+     * If the world is in range of 0..<2048, only that specific world will be cleared.
+     */
+    public fun clearEntities(worldId: Int) {
+        checkCommunicationThread()
+        if (isDestroyed()) return
+        require(worldId == ROOT_WORLD || worldId in 0..<2048) {
+            "World id must be -1 or in range of 0..<2048"
+        }
+        if (worldId == ROOT_WORLD) {
+            // If requesting clear entities for the root world, we essentially reset everything
+            // which is exactly what onReconnect ends up doing as well.
+            onReconnect()
+        } else {
+            destroyWorld(worldId)
+            allocateWorld(worldId)
+        }
+    }
+
     private fun releaseObservers(details: NpcInfoWorldDetails) {
         for (i in 0..<details.highResolutionNpcIndexCount) {
             val npcIndex = details.highResolutionNpcIndices[i].toInt()
             val avatar = repository.getOrNull(npcIndex) ?: continue
-            avatar.removeObserver()
+            avatar.removeObserver(localPlayerIndex)
         }
     }
 
@@ -753,5 +1044,12 @@ public class NpcInfo internal constructor(
          * Maximum unsigned short constant, the capacity of the npc info protocol.
          */
         private const val NPC_INFO_CAPACITY = 0xFFFF
+
+        /**
+         * The priority flag for normal priority NPCs.
+         */
+        private const val AVATAR_NORMAL_PRIORITY_FLAG: Int = 0x1
+
+        private val logger = InlineLogger()
     }
 }

@@ -1,17 +1,18 @@
 package net.rsprot.protocol.game.outgoing.info.worldentityinfo
 
+import com.github.michaelbull.logging.InlineLogger
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.ByteBufAllocator
 import net.rsprot.buffer.JagByteBuf
 import net.rsprot.buffer.extensions.toJagByteBuf
-import net.rsprot.protocol.common.checkCommunicationThread
 import net.rsprot.protocol.common.client.OldSchoolClientType
-import net.rsprot.protocol.common.game.outgoing.info.CoordGrid
-import net.rsprot.protocol.common.game.outgoing.info.util.ZoneIndexStorage
 import net.rsprot.protocol.game.outgoing.info.ByteBufRecycler
 import net.rsprot.protocol.game.outgoing.info.exceptions.InfoProcessException
 import net.rsprot.protocol.game.outgoing.info.util.BuildArea
 import net.rsprot.protocol.game.outgoing.info.util.ReferencePooledObject
+import net.rsprot.protocol.internal.checkCommunicationThread
+import net.rsprot.protocol.internal.game.outgoing.info.CoordGrid
+import net.rsprot.protocol.internal.game.outgoing.info.util.ZoneIndexStorage
 
 /**
  * The world entity info class tracks everything about the world entities that
@@ -83,6 +84,13 @@ public class WorldEntityInfo internal constructor(
     private val removedWorldEntities = ArrayList<Int>()
     private var buffer: ByteBuf? = null
 
+    /**
+     * The previous world entity info packet that was created.
+     * We ensure that a server hasn't accidentally left a packet unwritten, which would
+     * de-synchronize the client and cause errors.
+     */
+    internal var previousPacket: WorldEntityInfoPacket? = null
+
     @Volatile
     internal var exception: Exception? = null
     private var renderCoord: CoordGrid = CoordGrid.INVALID
@@ -100,6 +108,7 @@ public class WorldEntityInfo internal constructor(
      */
     public fun updateRenderDistance(distance: Int) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.renderDistance = distance
     }
 
@@ -110,6 +119,7 @@ public class WorldEntityInfo internal constructor(
      */
     public fun updateBuildArea(buildArea: BuildArea) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.buildArea = buildArea
     }
 
@@ -129,6 +139,7 @@ public class WorldEntityInfo internal constructor(
         heightInZones: Int = BuildArea.DEFAULT_BUILD_AREA_SIZE,
     ) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.buildArea = BuildArea(zoneX, zoneZ, widthInZones, heightInZones)
     }
 
@@ -137,7 +148,10 @@ public class WorldEntityInfo internal constructor(
      * allowing for correct functionality for player and npc infos, as well as zone updates.
      * @return a list of indices of the world entities currently in high resolution.
      */
-    public fun getAllWorldEntityIndices(): List<Int> = this.allWorldEntities
+    public fun getAllWorldEntityIndices(): List<Int> {
+        if (isDestroyed()) return emptyList()
+        return this.allWorldEntities
+    }
 
     /**
      * Gets the indices of all the world entities that were added to high resolution in this cycle,
@@ -146,7 +160,10 @@ public class WorldEntityInfo internal constructor(
      * @return a list of all the world entity indices added to the high resolution view in this
      * cycle.
      */
-    public fun getAddedWorldEntityIndices(): List<Int> = this.addedWorldEntities
+    public fun getAddedWorldEntityIndices(): List<Int> {
+        if (isDestroyed()) return emptyList()
+        return this.addedWorldEntities
+    }
 
     /**
      * Gets the indices of all the world entities that were removed from the high resolution in
@@ -155,7 +172,10 @@ public class WorldEntityInfo internal constructor(
      * @return a list of all the indices of the world entities that were removed from the high
      * resolution view this cycle.
      */
-    public fun getRemovedWorldEntityIndices(): List<Int> = this.removedWorldEntities
+    public fun getRemovedWorldEntityIndices(): List<Int> {
+        if (isDestroyed()) return emptyList()
+        return this.removedWorldEntities
+    }
 
     /**
      * Updates the current real absolute coordinate of the local player in the world.
@@ -173,8 +193,10 @@ public class WorldEntityInfo internal constructor(
         z: Int,
     ) {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.currentWorldEntityId = worldId
-        this.currentCoord = CoordGrid(level, x, z)
+        this.currentCoord =
+            CoordGrid(level, x, z)
     }
 
     /**
@@ -192,7 +214,9 @@ public class WorldEntityInfo internal constructor(
         z: Int,
     ) {
         checkCommunicationThread()
-        this.renderCoord = CoordGrid(level, x, z)
+        if (isDestroyed()) return
+        this.renderCoord =
+            CoordGrid(level, x, z)
     }
 
     /**
@@ -201,6 +225,7 @@ public class WorldEntityInfo internal constructor(
      */
     public fun resetRenderCoord() {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.renderCoord = CoordGrid.INVALID
     }
 
@@ -229,7 +254,9 @@ public class WorldEntityInfo internal constructor(
                 exception,
             )
         }
-        return WorldEntityInfoPacket(backingBuffer())
+        return checkNotNull(previousPacket) {
+            "Previous world entity info packet not calculated."
+        }
     }
 
     /**
@@ -278,6 +305,20 @@ public class WorldEntityInfo internal constructor(
             defragmentIndices()
         }
         processLowResolution(buffer)
+    }
+
+    /**
+     * Sets up the packet to be consumed with the next call.
+     */
+    internal fun postUpdate() {
+        if (this.previousPacket?.isConsumed() == false) {
+            logger.warn {
+                "Previous world entity info packet was calculated but " +
+                    "not sent out to the client for player index $localIndex!"
+            }
+        }
+        val packet = WorldEntityInfoPacket(backingBuffer())
+        this.previousPacket = packet
     }
 
     /**
@@ -442,6 +483,7 @@ public class WorldEntityInfo internal constructor(
         this.removedWorldEntities.clear()
         this.buffer = null
         this.exception = null
+        this.previousPacket = null
     }
 
     /**
@@ -449,8 +491,10 @@ public class WorldEntityInfo internal constructor(
      */
     public fun onReconnect() {
         checkCommunicationThread()
+        if (isDestroyed()) return
         this.buffer = null
         this.exception = null
+        this.previousPacket = null
         this.highResolutionIndicesCount = 0
         this.highResolutionIndices.fill(0)
         this.temporaryHighResolutionIndices.fill(0)
@@ -462,6 +506,30 @@ public class WorldEntityInfo internal constructor(
     override fun onDealloc() {
         checkCommunicationThread()
         this.buffer = null
+        this.previousPacket = null
+    }
+
+    /**
+     * Clears all the entities for the provided [worldId]. This function is __only__ intended to be used
+     * together with the [net.rsprot.protocol.game.outgoing.worldentity.ClearEntities] packet.
+     * This packet should only be called before [WorldEntityProtocol.update] has been called, otherwise
+     * problems may arise.
+     * @param worldId the world to clear, either [ROOT_WORLD] or a value from 0..<2048
+     * If the world is [ROOT_WORLD], all worlds will be cleared.
+     * If the world is in range of 0..<2048, only that specific world will be cleared.
+     */
+    public fun clearEntities(worldId: Int) {
+        checkCommunicationThread()
+        if (isDestroyed()) return
+        require(worldId == ROOT_WORLD || worldId in 0..<2048) {
+            "World id must be -1 or in range of 0..<2048"
+        }
+        // Only the root world has effect here. Nested world entities are not permitted, so
+        // we simply do nothing if this is called on a non-root world entity.
+        if (worldId == ROOT_WORLD) {
+            // Reconnect does exactly what this feature is supposed to do, so we just direct the call.
+            onReconnect()
+        }
     }
 
     public companion object {
@@ -498,5 +566,7 @@ public class WorldEntityInfo internal constructor(
          * If the packet ever changes, this MUST be adjusted accordingly.
          */
         private const val BUF_CAPACITY: Int = 1 + (MAX_HIGH_RES_COUNT * 1) + (MAX_HIGH_RES_COUNT * 10)
+
+        private val logger = InlineLogger()
     }
 }
