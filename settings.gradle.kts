@@ -23,12 +23,12 @@ include(
     "crypto",
     "compression",
     "protocol",
-    "protocol:osrs-224:osrs-224-api",
-    "protocol:osrs-224:osrs-224-common",
-    "protocol:osrs-224:osrs-224-desktop",
-    "protocol:osrs-224:osrs-224-internal",
-    "protocol:osrs-224:osrs-224-model",
-    "protocol:osrs-224:osrs-224-shared"
+    "protocol:osrs-228:osrs-228-api",
+    "protocol:osrs-228:osrs-228-common",
+    "protocol:osrs-228:osrs-228-desktop",
+    "protocol:osrs-228:osrs-228-internal",
+    "protocol:osrs-228:osrs-228-model",
+    "protocol:osrs-228:osrs-228-shared"
 )
 
 fun includeSubprojects(projectName: String) {
