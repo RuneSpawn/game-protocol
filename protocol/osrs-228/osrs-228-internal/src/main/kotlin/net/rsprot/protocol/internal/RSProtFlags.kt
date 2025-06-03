@@ -58,7 +58,7 @@ public object RSProtFlags {
     private val networkLoggingString: String =
         getString(
             "networkLogging",
-            "off",
+            "debug",
         )
 
     private val js5LoggingString: String =
